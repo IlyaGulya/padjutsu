@@ -254,9 +254,9 @@ impl Padjutsu {
         if buttons.is_empty() {
             return false;
         }
-        self.controllers.values().any(|st| {
-            buttons.iter().any(|btn| st.pressed.contains(*btn))
-        })
+        self.controllers
+            .values()
+            .any(|st| buttons.iter().any(|btn| st.pressed.contains(*btn)))
     }
 
     pub fn on_tick_with<F: FnMut(Effect)>(&mut self, sink: F) {
@@ -293,6 +293,10 @@ impl Padjutsu {
         let mut effects = Vec::new();
         self.on_tick_with(|effect| effects.push(effect));
         effects
+    }
+
+    pub fn reset_tick_clock(&self) {
+        self.sticks.borrow_mut().reset_tick_clock();
     }
 
     /// Return next due time for any repeat task, if any.

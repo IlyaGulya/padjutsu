@@ -149,6 +149,19 @@ Examples: `cmd+shift+l`, `option+space`, `enter`, `backspace`, `arrow_up`, `ctrl
 
 The process must be allowed under System Settings → Privacy & Security → Accessibility. The first run will prompt for permission.
 
+## Production latency metrics
+
+Release builds keep low-overhead latency metrics enabled. Aggregated reports are
+written to stderr every 60 seconds and cover SDL scheduling, dropped controller
+events, timer deadline lateness, stick tick gaps, performer queueing, mouse post
+cadence/deltas, and observed cursor tracking error.
+
+```bash
+just measure-latency 15              # temporary 5s reports + macOS sample
+PADJUTSU_METRICS=0 padjutsud run     # disable metrics
+PADJUTSU_METRICS_INTERVAL_S=300 ...  # report every five minutes
+```
+
 ## License
 
 MIT License. See `LICENSE`.

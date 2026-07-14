@@ -34,11 +34,13 @@ pub(crate) struct StickProcessor {
 #[derive(Default)]
 pub(super) struct TickPerfStats {
     pub(super) samples: u64,
-    pub(super) dt_us_total: u64,
-    pub(super) dt_us_max: u64,
-    pub(super) dt_us_spike_count: u64,
-    pub(super) tick_elapsed_us_total: u64,
-    pub(super) tick_elapsed_us_max: u64,
+    pub(super) expected_tick_us: u64,
+    pub(super) tick_interval_us: PerfHistogram,
+    pub(super) tick_execution_us: PerfHistogram,
+    pub(super) gap_over_1_5x: u64,
+    pub(super) gap_over_2x: u64,
+    pub(super) gap_over_4x: u64,
+    pub(super) missed_periods: u64,
     pub(super) mouse_mode_ticks: u64,
     pub(super) mouse_move_events: u64,
     pub(super) mouse_zero_move_ticks: u64,
@@ -49,6 +51,74 @@ pub(super) struct TickPerfStats {
     pub(super) mouse_chunk_over_32: u64,
     pub(super) scroll_events: u64,
     pub(super) last_report_at: Option<Instant>,
+}
+
+const PERF_BUCKETS: [u64; 13] = [
+    25,
+    50,
+    100,
+    250,
+    500,
+    1_000,
+    2_000,
+    4_000,
+    8_000,
+    12_000,
+    16_000,
+    32_000,
+    u64::MAX,
+];
+
+#[derive(Default)]
+pub(super) struct PerfHistogram {
+    samples: u64,
+    total: u128,
+    max: u64,
+    buckets: [u64; PERF_BUCKETS.len()],
+}
+
+impl PerfHistogram {
+    pub(super) fn record(&mut self, value: u64) {
+        self.samples += 1;
+        self.total += u128::from(value);
+        self.max = self.max.max(value);
+        let bucket = PERF_BUCKETS
+            .iter()
+            .position(|upper| value <= *upper)
+            .unwrap_or(PERF_BUCKETS.len() - 1);
+        self.buckets[bucket] += 1;
+    }
+
+    fn percentile(&self, percentile: u64) -> u64 {
+        if self.samples == 0 {
+            return 0;
+        }
+        let target = (self.samples * percentile).div_ceil(100);
+        let mut accumulated = 0;
+        for (index, count) in self.buckets.iter().enumerate() {
+            accumulated += count;
+            if accumulated >= target {
+                return PERF_BUCKETS[index].min(self.max);
+            }
+        }
+        self.max
+    }
+
+    pub(super) fn summary(&self) -> String {
+        let average = if self.samples == 0 {
+            0
+        } else {
+            self.total / u128::from(self.samples)
+        };
+        format!(
+            "n={},avg={},p95~{},p99~{},max={}",
+            self.samples,
+            average,
+            self.percentile(95),
+            self.percentile(99),
+            self.max
+        )
+    }
 }
 
 #[derive(Default)]
@@ -118,6 +188,10 @@ pub(super) struct RepeatReg {
 impl StickProcessor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn reset_tick_clock(&mut self) {
+        self.last_tick_at = None;
     }
 
     pub(super) fn dir_index(dir: Direction) -> usize {

@@ -241,6 +241,7 @@ fn process_overdue_wake(
         return DomainControl::Continue;
     };
 
+    wake_state.record_timer_wake(std::time::Instant::now());
     let step = reduce_event(event, padjutsu, manager, runtime_state, wake_state);
     apply_domain_step(step, runtime_state, action_runner, wake_state)
 }
@@ -253,6 +254,9 @@ fn dispatch_domain_event(
     manager: &ControllerManager,
     wake_state: &mut WakeState,
 ) -> DomainControl {
+    if matches!(&event, DomainEvent::Timer(TimerEvent::Wake)) {
+        wake_state.record_timer_wake(std::time::Instant::now());
+    }
     let step = reduce_event(event, padjutsu, manager, runtime_state, wake_state);
     apply_domain_step(step, runtime_state, action_runner, wake_state)
 }

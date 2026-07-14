@@ -4,6 +4,12 @@ use enigo::Coordinate;
 
 use crate::KeyCombo;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MouseMoveObservation {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+}
+
 /// Wrap a CG/Cocoa-using closure in a macOS autorelease pool so any
 /// internally-allocated CFData/NSObject autoreleased values are freed
 /// at the end of the call. Without a pool, those values accumulate in
@@ -68,13 +74,19 @@ mod relative_mouse {
     use enigo::{InputError, InputResult};
     use objc2_app_kit::NSEvent;
 
+    use super::MouseMoveObservation;
+
     /// Post a relative move while preserving Enigo's macOS semantics.
     ///
     /// The live cursor position and pressed buttons are intentionally queried
     /// for every event. Only the display height is cached by `Performer`;
     /// querying it through `CGDisplayPixelsHigh` on every tick can block on
     /// WindowServer for milliseconds under graphics load.
-    pub fn post(dx: i32, dy: i32, display_height: i32) -> InputResult<()> {
+    pub fn post(
+        dx: i32,
+        dy: i32,
+        display_height: i32,
+    ) -> InputResult<MouseMoveObservation> {
         let pressed = unsafe { NSEvent::pressedMouseButtons() };
         let point = unsafe { NSEvent::mouseLocation() };
         let current_x = point.x as i32;
@@ -110,7 +122,10 @@ mod relative_mouse {
         flags.insert(CGEventFlags::from_bits_retain(0x2000_0000));
         event.set_flags(flags);
         event.post(CGEventTapLocation::HID);
-        Ok(())
+        Ok(MouseMoveObservation {
+            x: current_x,
+            y: current_y,
+        })
     }
 }
 
@@ -330,13 +345,31 @@ impl Performer {
     /// Move mouse.
     #[cfg(target_os = "macos")]
     pub fn mouse_move(&mut self, x: i32, y: i32) -> InputResult<()> {
-        with_pool(|| relative_mouse::post(x, y, self.display_height))
+        self.mouse_move_observed(x, y).map(|_| ())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn mouse_move_observed(
+        &mut self,
+        x: i32,
+        y: i32,
+    ) -> InputResult<Option<MouseMoveObservation>> {
+        with_pool(|| relative_mouse::post(x, y, self.display_height)).map(Some)
     }
 
     /// Fallback for non-macOS systems.
     #[cfg(not(target_os = "macos"))]
     pub fn mouse_move(&mut self, x: i32, y: i32) -> InputResult<()> {
         with_pool(|| self.enigo.move_mouse(x, y, Coordinate::Rel))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn mouse_move_observed(
+        &mut self,
+        x: i32,
+        y: i32,
+    ) -> InputResult<Option<MouseMoveObservation>> {
+        self.mouse_move(x, y).map(|_| None)
     }
 
     /// Scroll horizontally.

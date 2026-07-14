@@ -21,7 +21,7 @@ start *ARGS:
 
 [group: 'build']
 install:
-  cargo install --profile release --path crates/padjutsud
+  cargo install --locked --profile release --path crates/padjutsud
   codesign --force --sign {{ quote(MACOS_DEBUG_SIGN_IDENTITY) }} {{ quote(BIN_PATH_INSTALLED) }}
 
 [group: 'build']

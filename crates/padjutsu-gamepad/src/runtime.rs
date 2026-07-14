@@ -63,7 +63,7 @@ mod mach_rt {
             mach_timebase_info(&mut info);
         }
         // abs_time = ns * denom / numer
-        ((ns as u64) * (info.denom as u64) / (info.numer as u64)) as u32
+        (ns * (info.denom as u64) / (info.numer as u64)) as u32
     }
 
     pub fn set_realtime_priority_impl() {
@@ -268,7 +268,7 @@ pub(crate) fn start_runtime_thread(
                             let id = which as ControllerId;
                             if button_state
                                 .get_mut(&id)
-                                .map_or(false, |s| s.remove(&btn))
+                                .is_some_and(|s| s.remove(&btn))
                             {
                                 broadcast(
                                     &inner,
@@ -408,7 +408,7 @@ pub(crate) fn start_runtime_thread(
                                 let id = which as ControllerId;
                                 if button_state
                                     .get_mut(&id)
-                                    .map_or(false, |s| s.remove(&btn))
+                                    .is_some_and(|s| s.remove(&btn))
                                 {
                                     broadcast(
                                         &inner,
@@ -578,12 +578,19 @@ fn broadcast(inner: &Inner, event: ControllerEvent) {
     } else {
         None
     };
+    let mut subscriber_drops = 0;
     if let Ok(mut subs) = inner.subscribers.lock() {
         subs.retain(|tx| match tx.try_send(event.clone()) {
             Ok(()) => true,
-            Err(TrySendError::Full(_)) => true, // keep subscriber, drop event
+            Err(TrySendError::Full(_)) => {
+                subscriber_drops += 1;
+                true
+            }
             Err(TrySendError::Disconnected(_)) => false, // remove subscriber
         });
+    }
+    if subscriber_drops > 0 {
+        METRICS.with(|m| m.borrow_mut().record_subscriber_drops(subscriber_drops));
     }
     if let Some(t0) = t0 {
         let cost = Instant::now().saturating_duration_since(t0);
@@ -594,6 +601,10 @@ fn broadcast(inner: &Inner, event: ControllerEvent) {
 /// Periodic metrics flush — called from the SDL event loop on every iteration.
 fn metrics_tick() {
     if crate::metrics::is_enabled() {
-        METRICS.with(|m| m.borrow_mut().maybe_report());
+        METRICS.with(|m| {
+            let mut metrics = m.borrow_mut();
+            metrics.record_loop_tick(Instant::now());
+            metrics.maybe_report();
+        });
     }
 }

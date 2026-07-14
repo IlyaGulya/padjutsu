@@ -21,6 +21,7 @@ fi
 
 cleanup() {
     launchctl unsetenv PADJUTSU_METRICS 2>/dev/null || true
+    launchctl unsetenv PADJUTSU_METRICS_INTERVAL_S 2>/dev/null || true
     launchctl kickstart -k "$service" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
@@ -31,6 +32,7 @@ if [ -f "$error_log" ]; then
 fi
 
 launchctl setenv PADJUTSU_METRICS 1
+launchctl setenv PADJUTSU_METRICS_INTERVAL_S 5
 launchctl kickstart -k "$service"
 
 pid=''
@@ -60,20 +62,24 @@ fi
 
 sample_file="/tmp/padjutsud-latency-$pid.sample"
 echo "Measuring padjutsud pid=$pid for ${duration}s. Move the mouse stick now."
-sample "$pid" "$duration" -file "$sample_file" >/dev/null
+if ! sample "$pid" "$duration" -file "$sample_file" >/dev/null 2>&1; then
+    echo "macOS sample was unavailable; daemon metrics will still be reported." >&2
+fi
 
 echo
 echo "Metrics:"
 if [ -f "$error_log" ]; then
     sed -n "$((start_line + 1)),\$p" "$error_log" \
-        | grep -E '\[(padjutsu|performer|stick)-metrics\]' \
+        | grep -E '\[(padjutsu|performer|stick|wake)-metrics\]' \
         || echo "No active stick samples were recorded."
 else
     echo "No error log found at $error_log."
 fi
 
-display_queries=$(grep -c 'SLSGetDisplayBounds' "$sample_file" || true)
-event_posts=$(grep -c 'SLEventPost' "$sample_file" || true)
-echo
-echo "Sample: $sample_file"
-echo "Hot-stack occurrences: display_bounds=$display_queries event_post=$event_posts"
+if [ -f "$sample_file" ]; then
+    display_queries=$(grep -c 'SLSGetDisplayBounds' "$sample_file" || true)
+    event_posts=$(grep -c 'SLEventPost' "$sample_file" || true)
+    echo
+    echo "Sample: $sample_file"
+    echo "Hot-stack occurrences: display_bounds=$display_queries event_post=$event_posts"
+fi

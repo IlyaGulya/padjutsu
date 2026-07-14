@@ -112,7 +112,9 @@ impl StickProcessor {
         let now = std::time::Instant::now();
         let started_at = now;
         let previous_tick_at = self.last_tick_at;
-        let dt_s = self.tick_dt_s(now);
+        let expected_tick_us = Self::expected_tick_us(bindings);
+        let expected_tick_s = expected_tick_us as f32 / 1_000_000.0;
+        let dt_s = self.tick_dt_s(now, expected_tick_s);
         let dt_us = previous_tick_at
             .map(|last_tick_at| {
                 now.saturating_duration_since(last_tick_at).as_micros() as u64
@@ -188,14 +190,21 @@ impl StickProcessor {
         self.repeater_cleanup_inactive();
         let tick_elapsed_us = started_at.elapsed().as_micros() as u64;
         self.perf.samples += 1;
-        self.perf.dt_us_total += dt_us;
-        self.perf.dt_us_max = self.perf.dt_us_max.max(dt_us);
-        if dt_us > 8000 {
-            self.perf.dt_us_spike_count += 1;
-        }
-        self.perf.tick_elapsed_us_total += tick_elapsed_us;
-        self.perf.tick_elapsed_us_max =
-            self.perf.tick_elapsed_us_max.max(tick_elapsed_us);
+        self.perf.expected_tick_us = expected_tick_us;
+        self.perf.tick_interval_us.record(dt_us);
+        self.perf.tick_execution_us.record(tick_elapsed_us);
+        self.perf.gap_over_1_5x +=
+            u64::from(dt_us > expected_tick_us.saturating_mul(3) / 2);
+        self.perf.gap_over_2x +=
+            u64::from(dt_us > expected_tick_us.saturating_mul(2));
+        self.perf.gap_over_4x +=
+            u64::from(dt_us > expected_tick_us.saturating_mul(4));
+        let elapsed_periods = dt_us
+            .saturating_add(expected_tick_us / 2)
+            .checked_div(expected_tick_us.max(1))
+            .unwrap_or(1)
+            .max(1);
+        self.perf.missed_periods += elapsed_periods.saturating_sub(1);
         if mouse_perf.mode_active {
             self.perf.mouse_mode_ticks += 1;
             self.perf.mouse_move_events += mouse_perf.move_events;
@@ -209,34 +218,35 @@ impl StickProcessor {
                 self.perf.mouse_zero_move_ticks += 1;
             }
         }
-        let should_report = self.perf.samples >= 120
-            || self.perf.last_report_at.is_some_and(|last| {
-                now.saturating_duration_since(last).as_secs() >= 2
+        if self.perf.last_report_at.is_none() {
+            self.perf.last_report_at = Some(now);
+        }
+        let should_report = Self::metrics_enabled()
+            && self.perf.last_report_at.is_some_and(|last| {
+                now.saturating_duration_since(last)
+                    >= Self::metrics_report_interval()
             });
         if should_report {
-            let avg_dt_us = self.perf.dt_us_total / self.perf.samples.max(1);
-            let avg_tick_elapsed_us =
-                self.perf.tick_elapsed_us_total / self.perf.samples.max(1);
-            if Self::metrics_enabled() {
-                eprintln!(
-                    "[stick-metrics] samples={} avg_dt_us={} max_dt_us={} dt_us_spikes={} avg_tick_elapsed_us={} max_tick_elapsed_us={} mouse_mode_ticks={} mouse_move_events={} mouse_zero_move_ticks={} mouse_distance_total={:.1} mouse_chunk_max={} mouse_chunk_over_8={} mouse_chunk_over_16={} mouse_chunk_over_32={} scroll_events={}",
-                    self.perf.samples,
-                    avg_dt_us,
-                    self.perf.dt_us_max,
-                    self.perf.dt_us_spike_count,
-                    avg_tick_elapsed_us,
-                    self.perf.tick_elapsed_us_max,
-                    self.perf.mouse_mode_ticks,
-                    self.perf.mouse_move_events,
-                    self.perf.mouse_zero_move_ticks,
-                    self.perf.mouse_distance_total,
-                    self.perf.mouse_chunk_max,
-                    self.perf.mouse_chunk_over_8,
-                    self.perf.mouse_chunk_over_16,
-                    self.perf.mouse_chunk_over_32,
-                    self.perf.scroll_events
-                );
-            }
+            eprintln!(
+                "[stick-metrics] samples={} expected_tick_us={} tick_interval_us({}) tick_execution_us({}) gap_over_1_5x={} gap_over_2x={} gap_over_4x={} missed_periods={} mouse_mode_ticks={} mouse_move_events={} mouse_zero_move_ticks={} mouse_distance_total={:.1} mouse_chunk_max={} mouse_chunk_over_8={} mouse_chunk_over_16={} mouse_chunk_over_32={} scroll_events={}",
+                self.perf.samples,
+                self.perf.expected_tick_us,
+                self.perf.tick_interval_us.summary(),
+                self.perf.tick_execution_us.summary(),
+                self.perf.gap_over_1_5x,
+                self.perf.gap_over_2x,
+                self.perf.gap_over_4x,
+                self.perf.missed_periods,
+                self.perf.mouse_mode_ticks,
+                self.perf.mouse_move_events,
+                self.perf.mouse_zero_move_ticks,
+                self.perf.mouse_distance_total,
+                self.perf.mouse_chunk_max,
+                self.perf.mouse_chunk_over_8,
+                self.perf.mouse_chunk_over_16,
+                self.perf.mouse_chunk_over_32,
+                self.perf.scroll_events
+            );
             self.perf = super::repeat::TickPerfStats {
                 last_report_at: Some(now),
                 ..Default::default()
@@ -252,14 +262,39 @@ impl StickProcessor {
     fn metrics_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var("PADJUTSU_METRICS").is_ok_and(|value| {
-                value == "1" || value.eq_ignore_ascii_case("true")
-            })
+            std::env::var("PADJUTSU_METRICS")
+                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+                .unwrap_or(true)
         })
     }
 
-    fn tick_dt_s(&mut self, now: std::time::Instant) -> f32 {
-        const DEFAULT_DT_S: f32 = 0.010;
+    fn metrics_report_interval() -> std::time::Duration {
+        static INTERVAL: std::sync::OnceLock<std::time::Duration> =
+            std::sync::OnceLock::new();
+        *INTERVAL.get_or_init(|| {
+            let seconds = std::env::var("PADJUTSU_METRICS_INTERVAL_S")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(60)
+                .clamp(5, 3_600);
+            std::time::Duration::from_secs(seconds)
+        })
+    }
+
+    fn expected_tick_us(bindings: &CompiledStickRules) -> u64 {
+        [bindings.left(), bindings.right()]
+            .into_iter()
+            .filter_map(|mode| match mode {
+                Some(StickMode::MouseMove(params)) => Some(params.runtime.tick_ms),
+                Some(StickMode::Scroll(params)) => Some(params.runtime.tick_ms),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(10)
+            .saturating_mul(1_000)
+    }
+
+    fn tick_dt_s(&mut self, now: std::time::Instant, default_dt_s: f32) -> f32 {
         const MIN_DT_S: f32 = 0.001;
         const MAX_DT_S: f32 = 0.050;
 
@@ -268,7 +303,7 @@ impl StickProcessor {
             .map(|last_tick_at| {
                 now.saturating_duration_since(last_tick_at).as_secs_f32()
             })
-            .unwrap_or(DEFAULT_DT_S)
+            .unwrap_or(default_dt_s)
             .clamp(MIN_DT_S, MAX_DT_S);
         self.last_tick_at = Some(now);
         dt_s
@@ -1071,5 +1106,17 @@ mod tests {
                 "horizontal scroll should be zero when horizontal=false"
             );
         }
+    }
+
+    #[test]
+    fn reset_tick_clock_uses_nominal_period_after_idle() {
+        let mut processor = StickProcessor::new();
+        let now = std::time::Instant::now();
+        processor.last_tick_at = Some(now - std::time::Duration::from_millis(100));
+
+        processor.reset_tick_clock();
+        let dt_s = processor.tick_dt_s(now, 0.008);
+
+        assert!((dt_s - 0.008).abs() < f32::EPSILON);
     }
 }

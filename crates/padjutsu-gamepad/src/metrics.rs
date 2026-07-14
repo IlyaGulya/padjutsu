@@ -5,8 +5,9 @@
 //! main number that should improve when switching from SDL2/GameController
 //! to IOKit/IOHIDManager directly.
 //!
-//! Enable by setting `PADJUTSU_METRICS=1` env var. Output goes to stderr
-//! every 5 seconds.
+//! Enabled by default with a low-frequency production report. Set
+//! `PADJUTSU_METRICS=0` to disable or `PADJUTSU_METRICS_INTERVAL_S` to change
+//! the reporting interval.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -17,12 +18,18 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
     let on = std::env::var("PADJUTSU_METRICS")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+        .map(|value| {
+            value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("no")
+        })
+        .unwrap_or(true);
     ENABLED.store(on, Ordering::Relaxed);
     if on {
-        eprintln!("[padjutsu-metrics] enabled (PADJUTSU_METRICS=1)");
+        eprintln!(
+            "[padjutsu-metrics] production metrics enabled; interval={}s",
+            metrics_report_interval().as_secs()
+        );
     }
 }
 
@@ -35,7 +42,8 @@ pub fn is_enabled() -> bool {
 /// Buckets in microseconds. Anything beyond 30ms is considered a "pause" between
 /// stick movements (user not moving the stick) and excluded from poll-period stats.
 const BUCKETS_US: &[u64] = &[
-    250, 500, 1_000, 2_000, 3_000, 4_000, 6_000, 8_000, 10_000, 12_000, 14_000, 16_000, 20_000, 25_000, 30_000,
+    250, 500, 1_000, 2_000, 3_000, 4_000, 6_000, 8_000, 10_000, 12_000, 14_000,
+    16_000, 20_000, 25_000, 30_000,
 ];
 const POLL_CUTOFF_US: u64 = 30_000;
 
@@ -59,6 +67,14 @@ impl Histogram {
             self.pauses += 1;
             return;
         }
+        self.observe_us(us);
+    }
+
+    fn observe_all(&mut self, dt: Duration) {
+        self.observe_us(dt.as_micros().min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn observe_us(&mut self, us: u64) {
         self.n += 1;
         self.sum_us += us as u128;
         if self.n == 1 || us > self.max_us {
@@ -117,6 +133,9 @@ pub struct Metrics {
     last_axis_event: [Option<Instant>; 6],
     axis_delta: [Histogram; 6],
     broadcast_cost: Histogram,
+    loop_gap: Histogram,
+    last_loop_tick: Option<Instant>,
+    subscriber_drops: u64,
     button_events: u64,
     axis_events: u64,
     last_report: Instant,
@@ -129,10 +148,13 @@ impl Default for Metrics {
             last_axis_event: Default::default(),
             axis_delta: Default::default(),
             broadcast_cost: Histogram::default(),
+            loop_gap: Histogram::default(),
+            last_loop_tick: None,
+            subscriber_drops: 0,
             button_events: 0,
             axis_events: 0,
             last_report: Instant::now(),
-            report_interval: Duration::from_secs(5),
+            report_interval: metrics_report_interval(),
         }
     }
 }
@@ -189,6 +211,23 @@ impl Metrics {
         self.broadcast_cost.observe(dt);
     }
 
+    pub fn record_subscriber_drops(&mut self, count: u64) {
+        if is_enabled() {
+            self.subscriber_drops += count;
+        }
+    }
+
+    pub fn record_loop_tick(&mut self, now: Instant) {
+        if !is_enabled() {
+            return;
+        }
+        if let Some(previous) = self.last_loop_tick {
+            self.loop_gap
+                .observe_all(now.saturating_duration_since(previous));
+        }
+        self.last_loop_tick = Some(now);
+    }
+
     pub fn maybe_report(&mut self) {
         if !is_enabled() {
             return;
@@ -202,10 +241,11 @@ impl Metrics {
 
     fn report(&mut self, now: Instant) {
         eprintln!(
-            "[padjutsu-metrics] interval={}s axis_events={} button_events={}",
+            "[padjutsu-metrics] interval={}s axis_events={} button_events={} subscriber_drops={}",
             self.report_interval.as_secs(),
             self.axis_events,
             self.button_events,
+            self.subscriber_drops,
         );
         for i in 0..6 {
             let h = &self.axis_delta[i];
@@ -236,13 +276,51 @@ impl Metrics {
                 h.max_us,
             );
         }
+        if self.loop_gap.n > 0 {
+            let h = &self.loop_gap;
+            eprintln!(
+                "[padjutsu-metrics]   sdl_loop_gap: n={} avg={}us p95<={}us p99<={}us max={}us",
+                h.n,
+                h.avg_us(),
+                h.percentile_us(0.95),
+                h.percentile_us(0.99),
+                h.max_us,
+            );
+        }
         // Reset window so each report covers only the last interval.
         for h in self.axis_delta.iter_mut() {
             h.reset();
         }
         self.broadcast_cost.reset();
+        self.loop_gap.reset();
         self.button_events = 0;
         self.axis_events = 0;
+        self.subscriber_drops = 0;
         self.last_report = now;
+    }
+}
+
+fn metrics_report_interval() -> Duration {
+    let seconds = std::env::var("PADJUTSU_METRICS_INTERVAL_S")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(5, 3_600);
+    Duration::from_secs(seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_histogram_keeps_long_scheduler_stalls() {
+        let mut histogram = Histogram::default();
+        histogram.observe_all(Duration::from_millis(75));
+
+        assert_eq!(histogram.n, 1);
+        assert_eq!(histogram.pauses, 0);
+        assert_eq!(histogram.max_us, 75_000);
+        assert_eq!(histogram.percentile_us(0.99), 75_000);
     }
 }

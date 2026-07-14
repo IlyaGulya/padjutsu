@@ -9,7 +9,7 @@
 //! Relative deltas can be summed, so a backlog needs one system post rather
 //! than one post per missed tick.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use enigo::Button;
 
-use crate::performer::Performer;
+use crate::performer::{MouseMoveObservation, Performer};
 use crate::KeyCombo;
 
 /// Commands sent to the worker thread.
@@ -46,6 +46,7 @@ pub enum PerformerCmd {
 pub struct PerformerWorker {
     tx: Sender<QueuedCmd>,
     stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -56,18 +57,21 @@ impl PerformerWorker {
         let (tx, rx) = bounded::<QueuedCmd>(1024);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_w = stop.clone();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let dropped_w = dropped.clone();
         let join = thread::Builder::new()
             .name("performer-worker".into())
             .stack_size(512 * 1024)
             .spawn(move || {
                 #[cfg(target_os = "macos")]
                 set_realtime_priority_2ms();
-                run(&mut performer, rx, stop_w);
+                run(&mut performer, rx, stop_w, dropped_w);
             })
             .expect("failed to spawn performer worker");
         Self {
             tx,
             stop,
+            dropped,
             join: Some(join),
         }
     }
@@ -84,12 +88,16 @@ impl PerformerWorker {
             cmd,
             enqueued_at: Instant::now(),
         };
-        self.tx.try_send(queued).map_err(|error| match error {
-            TrySendError::Full(queued) => TrySendError::Full(queued.cmd),
-            TrySendError::Disconnected(queued) => {
-                TrySendError::Disconnected(queued.cmd)
+        match self.tx.try_send(queued) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(queued)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Err(TrySendError::Full(queued.cmd))
             }
-        })
+            Err(TrySendError::Disconnected(queued)) => {
+                Err(TrySendError::Disconnected(queued.cmd))
+            }
+        }
     }
 }
 
@@ -113,8 +121,13 @@ struct QueuedCmd {
     enqueued_at: Instant,
 }
 
-fn run(performer: &mut Performer, rx: Receiver<QueuedCmd>, stop: Arc<AtomicBool>) {
-    let mut metrics = WorkerMetrics::new(metrics_enabled());
+fn run(
+    performer: &mut Performer,
+    rx: Receiver<QueuedCmd>,
+    stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
+) {
+    let mut metrics = WorkerMetrics::new(metrics_enabled(), dropped);
     while !stop.load(Ordering::Acquire) {
         // Block for at least one command.
         let first = match rx.recv() {
@@ -162,7 +175,16 @@ fn execute_batch(
                 }
                 if sum_dx != 0 || sum_dy != 0 {
                     let started_at = metrics.start_execution();
-                    let _ = performer.mouse_move(sum_dx, sum_dy);
+                    let observation =
+                        performer.mouse_move_observed(sum_dx, sum_dy).ok().flatten();
+                    metrics.record_mouse(
+                        sum_dx,
+                        sum_dy,
+                        i - segment_start,
+                        batch[segment_start].enqueued_at,
+                        started_at,
+                        observation,
+                    );
                     metrics.record_execution(ExecutionKind::Mouse, started_at);
                 }
                 metrics.record_coalesced(i - segment_start - 1);
@@ -257,7 +279,6 @@ fn execute_one(performer: &mut Performer, cmd: &PerformerCmd) {
     }
 }
 
-const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const LATENCY_BUCKETS_US: [u64; 12] = [
     25,
     50,
@@ -272,6 +293,7 @@ const LATENCY_BUCKETS_US: [u64; 12] = [
     32_000,
     u64::MAX,
 ];
+const VALUE_BUCKETS: [u64; 12] = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, u64::MAX];
 
 #[derive(Clone, Copy)]
 enum ExecutionKind {
@@ -333,32 +355,122 @@ impl TimingStats {
     }
 }
 
+#[derive(Default)]
+struct ValueStats {
+    samples: u64,
+    total: u128,
+    max: u64,
+    buckets: [u64; VALUE_BUCKETS.len()],
+}
+
+impl ValueStats {
+    fn record(&mut self, value: u64) {
+        self.samples += 1;
+        self.total += u128::from(value);
+        self.max = self.max.max(value);
+        let bucket = VALUE_BUCKETS
+            .iter()
+            .position(|upper| value <= *upper)
+            .unwrap_or(VALUE_BUCKETS.len() - 1);
+        self.buckets[bucket] += 1;
+    }
+
+    fn percentile(&self, percentile: u64) -> u64 {
+        if self.samples == 0 {
+            return 0;
+        }
+        let target = (self.samples * percentile).div_ceil(100);
+        let mut accumulated = 0;
+        for (index, count) in self.buckets.iter().enumerate() {
+            accumulated += count;
+            if accumulated >= target {
+                return VALUE_BUCKETS[index].min(self.max);
+            }
+        }
+        self.max
+    }
+
+    fn summary(&self) -> String {
+        let average = if self.samples == 0 {
+            0
+        } else {
+            self.total / u128::from(self.samples)
+        };
+        format!(
+            "n={},avg={},p95~{},p99~{},max={}",
+            self.samples,
+            average,
+            self.percentile(95),
+            self.percentile(99),
+            self.max
+        )
+    }
+}
+
 struct WorkerMetrics {
     enabled: bool,
     started_at: Instant,
+    report_interval: Duration,
+    dropped: Arc<AtomicU64>,
     batches: u64,
     commands: u64,
     executions: u64,
     coalesced: u64,
     max_batch: usize,
     queue_wait: TimingStats,
+    queue_wait_over_4ms: u64,
+    queue_wait_over_16ms: u64,
     mouse_post: TimingStats,
+    mouse_post_over_4ms: u64,
+    mouse_post_over_16ms: u64,
+    mouse_post_over_50ms: u64,
+    mouse_post_interval: TimingStats,
+    mouse_input_age: TimingStats,
+    mouse_delta_axis: ValueStats,
+    mouse_delta_change_axis: ValueStats,
+    cursor_tracking_error_axis: ValueStats,
+    cursor_stalled: u64,
+    mouse_posts: u64,
+    mouse_commands: u64,
+    max_mouse_commands_per_post: usize,
+    last_mouse_post_at: Option<Instant>,
+    last_mouse_delta: Option<(i32, i32)>,
+    last_cursor: Option<(i32, i32)>,
     scroll_post: TimingStats,
     other_execution: TimingStats,
 }
 
 impl WorkerMetrics {
-    fn new(enabled: bool) -> Self {
+    fn new(enabled: bool, dropped: Arc<AtomicU64>) -> Self {
         Self {
             enabled,
             started_at: Instant::now(),
+            report_interval: metrics_report_interval(),
+            dropped,
             batches: 0,
             commands: 0,
             executions: 0,
             coalesced: 0,
             max_batch: 0,
             queue_wait: TimingStats::default(),
+            queue_wait_over_4ms: 0,
+            queue_wait_over_16ms: 0,
             mouse_post: TimingStats::default(),
+            mouse_post_over_4ms: 0,
+            mouse_post_over_16ms: 0,
+            mouse_post_over_50ms: 0,
+            mouse_post_interval: TimingStats::default(),
+            mouse_input_age: TimingStats::default(),
+            mouse_delta_axis: ValueStats::default(),
+            mouse_delta_change_axis: ValueStats::default(),
+            cursor_tracking_error_axis: ValueStats::default(),
+            cursor_stalled: 0,
+            mouse_posts: 0,
+            mouse_commands: 0,
+            max_mouse_commands_per_post: 0,
+            last_mouse_post_at: None,
+            last_mouse_delta: None,
+            last_cursor: None,
             scroll_post: TimingStats::default(),
             other_execution: TimingStats::default(),
         }
@@ -373,8 +485,10 @@ impl WorkerMetrics {
         self.max_batch = self.max_batch.max(batch.len());
         let now = Instant::now();
         for queued in batch {
-            self.queue_wait
-                .record(now.saturating_duration_since(queued.enqueued_at));
+            let wait = now.saturating_duration_since(queued.enqueued_at);
+            self.queue_wait.record(wait);
+            self.queue_wait_over_4ms += u64::from(wait > Duration::from_millis(4));
+            self.queue_wait_over_16ms += u64::from(wait > Duration::from_millis(16));
         }
     }
 
@@ -393,10 +507,74 @@ impl WorkerMetrics {
         self.executions += 1;
         let elapsed = started_at.elapsed();
         match kind {
-            ExecutionKind::Mouse => self.mouse_post.record(elapsed),
+            ExecutionKind::Mouse => {
+                self.mouse_post.record(elapsed);
+                self.mouse_post_over_4ms +=
+                    u64::from(elapsed > Duration::from_millis(4));
+                self.mouse_post_over_16ms +=
+                    u64::from(elapsed > Duration::from_millis(16));
+                self.mouse_post_over_50ms +=
+                    u64::from(elapsed > Duration::from_millis(50));
+            }
             ExecutionKind::Scroll => self.scroll_post.record(elapsed),
             ExecutionKind::Other => self.other_execution.record(elapsed),
         }
+    }
+
+    fn record_mouse(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        command_count: usize,
+        oldest_enqueued_at: Instant,
+        post_started_at: Option<Instant>,
+        observation: Option<MouseMoveObservation>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let post_started_at = post_started_at.unwrap_or_else(Instant::now);
+        self.mouse_posts += 1;
+        self.mouse_commands += command_count as u64;
+        self.max_mouse_commands_per_post =
+            self.max_mouse_commands_per_post.max(command_count);
+        self.mouse_input_age
+            .record(post_started_at.saturating_duration_since(oldest_enqueued_at));
+        if let Some(previous) = self.last_mouse_post_at {
+            self.mouse_post_interval
+                .record(post_started_at.saturating_duration_since(previous));
+        }
+        self.last_mouse_post_at = Some(post_started_at);
+
+        let delta_axis = u64::from(dx.unsigned_abs().max(dy.unsigned_abs()));
+        self.mouse_delta_axis.record(delta_axis);
+        if let Some((previous_dx, previous_dy)) = self.last_mouse_delta {
+            let change_axis = i64::from(dx)
+                .abs_diff(i64::from(previous_dx))
+                .max(i64::from(dy).abs_diff(i64::from(previous_dy)));
+            self.mouse_delta_change_axis.record(change_axis);
+        }
+
+        if let Some(observation) = observation {
+            if let (Some((cursor_x, cursor_y)), Some((expected_dx, expected_dy))) =
+                (self.last_cursor, self.last_mouse_delta)
+            {
+                let observed_dx = observation.x.saturating_sub(cursor_x);
+                let observed_dy = observation.y.saturating_sub(cursor_y);
+                let error_axis = i64::from(observed_dx)
+                    .abs_diff(i64::from(expected_dx))
+                    .max(i64::from(observed_dy).abs_diff(i64::from(expected_dy)));
+                self.cursor_tracking_error_axis.record(error_axis);
+                if observed_dx == 0
+                    && observed_dy == 0
+                    && (expected_dx != 0 || expected_dy != 0)
+                {
+                    self.cursor_stalled += 1;
+                }
+            }
+            self.last_cursor = Some((observation.x, observation.y));
+        }
+        self.last_mouse_delta = Some((dx, dy));
     }
 
     fn record_coalesced(&mut self, count: usize) {
@@ -406,30 +584,63 @@ impl WorkerMetrics {
     }
 
     fn maybe_report(&mut self, queue_len: usize) {
-        if !self.enabled || self.started_at.elapsed() < METRICS_REPORT_INTERVAL {
+        if !self.enabled || self.started_at.elapsed() < self.report_interval {
             return;
         }
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
         eprintln!(
-            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} max_batch={} queue_len={} queue_wait_us({}) mouse_post_us({}) scroll_post_us({}) other_execution_us({})",
+            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} mouse_posts={} mouse_commands={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
             self.started_at.elapsed().as_millis(),
             self.batches,
             self.commands,
             self.executions,
             self.coalesced,
+            dropped,
             self.max_batch,
             queue_len,
             self.queue_wait.summary(),
+            self.queue_wait_over_4ms,
+            self.queue_wait_over_16ms,
             self.mouse_post.summary(),
+            self.mouse_post_over_4ms,
+            self.mouse_post_over_16ms,
+            self.mouse_post_over_50ms,
+            self.mouse_post_interval.summary(),
+            self.mouse_input_age.summary(),
+            self.mouse_delta_axis.summary(),
+            self.mouse_delta_change_axis.summary(),
+            self.cursor_tracking_error_axis.summary(),
+            self.cursor_stalled,
+            self.mouse_posts,
+            self.mouse_commands,
+            self.max_mouse_commands_per_post,
             self.scroll_post.summary(),
             self.other_execution.summary(),
         );
-        *self = Self::new(true);
+        let dropped = self.dropped.clone();
+        let last_mouse_post_at = self.last_mouse_post_at;
+        let last_mouse_delta = self.last_mouse_delta;
+        let last_cursor = self.last_cursor;
+        *self = Self::new(true, dropped);
+        self.last_mouse_post_at = last_mouse_post_at;
+        self.last_mouse_delta = last_mouse_delta;
+        self.last_cursor = last_cursor;
     }
 }
 
 fn metrics_enabled() -> bool {
     std::env::var("PADJUTSU_METRICS")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
+fn metrics_report_interval() -> Duration {
+    let seconds = std::env::var("PADJUTSU_METRICS_INTERVAL_S")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(5, 3_600);
+    Duration::from_secs(seconds)
 }
 
 // --- macOS realtime priority for the performer worker thread ---
@@ -532,7 +743,7 @@ mod tests {
 
     #[test]
     fn coalesce_breaks_at_non_movement() {
-        let cmds = vec![
+        let cmds = [
             PerformerCmd::MouseMove { dx: 5, dy: 0 },
             PerformerCmd::MouseClick(Button::Left),
             PerformerCmd::MouseMove { dx: 3, dy: 0 },
@@ -559,5 +770,44 @@ mod tests {
         assert_eq!(stats.percentile(50), 250);
         assert_eq!(stats.percentile(95), 20_000);
         assert_eq!(stats.percentile(99), 20_000);
+    }
+
+    #[test]
+    fn mouse_metrics_detect_cursor_that_did_not_apply_previous_delta() {
+        let now = Instant::now();
+        let mut metrics = WorkerMetrics::new(true, Arc::new(AtomicU64::new(0)));
+        metrics.record_mouse(
+            5,
+            0,
+            1,
+            now,
+            Some(now),
+            Some(MouseMoveObservation { x: 100, y: 100 }),
+        );
+        metrics.record_mouse(
+            5,
+            0,
+            2,
+            now + Duration::from_millis(7),
+            Some(now + Duration::from_millis(8)),
+            Some(MouseMoveObservation { x: 100, y: 100 }),
+        );
+
+        assert_eq!(metrics.cursor_stalled, 1);
+        assert_eq!(metrics.cursor_tracking_error_axis.max, 5);
+        assert_eq!(metrics.mouse_post_interval.max_us, 8_000);
+        assert_eq!(metrics.max_mouse_commands_per_post, 2);
+    }
+
+    #[test]
+    fn mouse_metrics_count_rare_slow_posts_outside_percentiles() {
+        let mut metrics = WorkerMetrics::new(true, Arc::new(AtomicU64::new(0)));
+        let started_at = Instant::now() - Duration::from_millis(60);
+
+        metrics.record_execution(ExecutionKind::Mouse, Some(started_at));
+
+        assert_eq!(metrics.mouse_post_over_4ms, 1);
+        assert_eq!(metrics.mouse_post_over_16ms, 1);
+        assert_eq!(metrics.mouse_post_over_50ms, 1);
     }
 }
