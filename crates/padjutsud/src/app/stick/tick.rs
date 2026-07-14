@@ -3,7 +3,7 @@ use padjutsu_gamepad::ControllerId;
 use padjutsu_workspace::{Axis as ProfileAxis, StickMode, StickSide};
 
 use crate::app::Effect;
-use crate::{print_debug, print_info};
+use crate::print_debug;
 
 use super::compiled::CompiledStickRules;
 use super::repeat::{
@@ -159,7 +159,8 @@ impl StickProcessor {
         if matches!(bindings.left(), Some(StickMode::MouseMove(_)))
             || matches!(bindings.right(), Some(StickMode::MouseMove(_)))
         {
-            mouse_perf = self.tick_mouse(dt_s, &mut sink, axes_list, bindings, precision);
+            mouse_perf =
+                self.tick_mouse(dt_s, &mut sink, axes_list, bindings, precision);
         }
         let has_scroll = matches!(bindings.left(), Some(StickMode::Scroll(_)))
             || matches!(bindings.right(), Some(StickMode::Scroll(_)));
@@ -167,15 +168,19 @@ impl StickProcessor {
             self.tick_scroll(dt_s, &mut sink, axes_list, bindings);
         }
         if self.generation % 500 == 1 {
-            let axes_dbg: Vec<_> = axes_list.iter().map(|(cid, a)| {
-                format!("c{cid}:LX={:.2},LY={:.2},RX={:.2},RY={:.2},LT={:.2},RT={:.2}", a[0],a[1],a[2],a[3],a[4],a[5])
-            }).collect();
-            print_info!(
+            print_debug!(
                 "stick modes: left={:?} right={:?} has_scroll={} axes=[{}]",
-                bindings.left().map(|m| std::mem::discriminant(m)),
-                bindings.right().map(|m| std::mem::discriminant(m)),
+                bindings.left().map(std::mem::discriminant),
+                bindings.right().map(std::mem::discriminant),
                 has_scroll,
-                axes_dbg.join("; ")
+                axes_list
+                    .iter()
+                    .map(|(cid, a)| format!(
+                        "c{cid}:LX={:.2},LY={:.2},RX={:.2},RY={:.2},LT={:.2},RT={:.2}",
+                        a[0], a[1], a[2], a[3], a[4], a[5]
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             );
         }
 
@@ -212,24 +217,26 @@ impl StickProcessor {
             let avg_dt_us = self.perf.dt_us_total / self.perf.samples.max(1);
             let avg_tick_elapsed_us =
                 self.perf.tick_elapsed_us_total / self.perf.samples.max(1);
-            print_info!(
-                "perf stick: samples={} avg_dt_us={} max_dt_us={} dt_us_spikes={} avg_tick_elapsed_us={} max_tick_elapsed_us={} mouse_mode_ticks={} mouse_move_events={} mouse_zero_move_ticks={} mouse_distance_total={:.1} mouse_chunk_max={} mouse_chunk_over_8={} mouse_chunk_over_16={} mouse_chunk_over_32={} scroll_events={}",
-                self.perf.samples,
-                avg_dt_us,
-                self.perf.dt_us_max,
-                self.perf.dt_us_spike_count,
-                avg_tick_elapsed_us,
-                self.perf.tick_elapsed_us_max,
-                self.perf.mouse_mode_ticks,
-                self.perf.mouse_move_events,
-                self.perf.mouse_zero_move_ticks,
-                self.perf.mouse_distance_total,
-                self.perf.mouse_chunk_max,
-                self.perf.mouse_chunk_over_8,
-                self.perf.mouse_chunk_over_16,
-                self.perf.mouse_chunk_over_32,
-                self.perf.scroll_events
-            );
+            if Self::metrics_enabled() {
+                eprintln!(
+                    "[stick-metrics] samples={} avg_dt_us={} max_dt_us={} dt_us_spikes={} avg_tick_elapsed_us={} max_tick_elapsed_us={} mouse_mode_ticks={} mouse_move_events={} mouse_zero_move_ticks={} mouse_distance_total={:.1} mouse_chunk_max={} mouse_chunk_over_8={} mouse_chunk_over_16={} mouse_chunk_over_32={} scroll_events={}",
+                    self.perf.samples,
+                    avg_dt_us,
+                    self.perf.dt_us_max,
+                    self.perf.dt_us_spike_count,
+                    avg_tick_elapsed_us,
+                    self.perf.tick_elapsed_us_max,
+                    self.perf.mouse_mode_ticks,
+                    self.perf.mouse_move_events,
+                    self.perf.mouse_zero_move_ticks,
+                    self.perf.mouse_distance_total,
+                    self.perf.mouse_chunk_max,
+                    self.perf.mouse_chunk_over_8,
+                    self.perf.mouse_chunk_over_16,
+                    self.perf.mouse_chunk_over_32,
+                    self.perf.scroll_events
+                );
+            }
             self.perf = super::repeat::TickPerfStats {
                 last_report_at: Some(now),
                 ..Default::default()
@@ -240,6 +247,15 @@ impl StickProcessor {
             self.generation,
             tick_elapsed_us
         );
+    }
+
+    fn metrics_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("PADJUTSU_METRICS").is_ok_and(|value| {
+                value == "1" || value.eq_ignore_ascii_case("true")
+            })
+        })
     }
 
     fn tick_dt_s(&mut self, now: std::time::Instant) -> f32 {
@@ -496,7 +512,13 @@ impl StickProcessor {
                 let side =
                     &mut self.controllers.entry(_cid).or_default().sides[sidx];
                 Self::tick_mouse_side(
-                    dt_s, params, axes, &StickSide::Left, side, precision, sink,
+                    dt_s,
+                    params,
+                    axes,
+                    &StickSide::Left,
+                    side,
+                    precision,
+                    sink,
                     &mut perf,
                 );
             }
@@ -506,7 +528,13 @@ impl StickProcessor {
                 let side =
                     &mut self.controllers.entry(_cid).or_default().sides[sidx];
                 Self::tick_mouse_side(
-                    dt_s, params, axes, &StickSide::Right, side, precision, sink,
+                    dt_s,
+                    params,
+                    axes,
+                    &StickSide::Right,
+                    side,
+                    precision,
+                    sink,
                     &mut perf,
                 );
             }
@@ -524,13 +552,10 @@ impl StickProcessor {
         sink: &mut impl FnMut(Effect),
         perf: &mut MousePerfFrame,
     ) {
-        let alpha = Self::mouse_smoothing_alpha(
-            dt_s,
-            params.runtime.smoothing_window_ms,
-        );
+        let alpha =
+            Self::mouse_smoothing_alpha(dt_s, params.runtime.smoothing_window_ms);
         let (x0, y0) = axes_for_side(axes, stick_side);
-        let (raw_x, raw_y) =
-            invert_xy(x0, y0, params.invert_x, params.invert_y);
+        let (raw_x, raw_y) = invert_xy(x0, y0, params.invert_x, params.invert_y);
         // Let the filter track raw input freely — never reset it.
         // This allows smooth zero-crossing during direction reversals
         // without getting trapped by the deadzone threshold.
@@ -560,12 +585,10 @@ impl StickProcessor {
                 let dx = accum.0.trunc() as i32;
                 let dy = accum.1.trunc() as i32;
                 if dx != 0 || dy != 0 {
-                    let chunk_perf =
-                        Self::emit_mouse_move_chunked(sink, dx, dy);
+                    let chunk_perf = Self::emit_mouse_move_chunked(sink, dx, dy);
                     perf.move_events += chunk_perf.move_events;
                     perf.distance_total += chunk_perf.distance_total;
-                    perf.chunk_max =
-                        perf.chunk_max.max(chunk_perf.chunk_max);
+                    perf.chunk_max = perf.chunk_max.max(chunk_perf.chunk_max);
                     perf.chunk_over_8 += chunk_perf.chunk_over_8;
                     perf.chunk_over_16 += chunk_perf.chunk_over_16;
                     perf.chunk_over_32 += chunk_perf.chunk_over_32;
@@ -903,7 +926,8 @@ mod tests {
         let params = scroll_params(true, true);
 
         // Push stick mostly down (y=0.8) with slight horizontal drift (x=0.1)
-        let effects = tick_scroll_n(&mut proc, &params, right_stick_axes(0.1, 0.8), 20);
+        let effects =
+            tick_scroll_n(&mut proc, &params, right_stick_axes(0.1, 0.8), 20);
         let scrolls = collect_scroll_effects(&effects);
 
         // Should have vertical scroll but NO horizontal scroll
@@ -923,7 +947,8 @@ mod tests {
         let params = scroll_params(true, true);
 
         // Push stick mostly right (x=0.8) with slight vertical drift (y=0.1)
-        let effects = tick_scroll_n(&mut proc, &params, right_stick_axes(0.8, 0.1), 20);
+        let effects =
+            tick_scroll_n(&mut proc, &params, right_stick_axes(0.8, 0.1), 20);
         let scrolls = collect_scroll_effects(&effects);
 
         assert!(!scrolls.is_empty(), "should produce scroll effects");
@@ -948,7 +973,8 @@ mod tests {
         tick_scroll_n(&mut proc, &params, right_stick_axes(0.0, 0.0), 25);
 
         // Now scroll horizontally — should lock to horizontal
-        let effects = tick_scroll_n(&mut proc, &params, right_stick_axes(0.8, 0.1), 20);
+        let effects =
+            tick_scroll_n(&mut proc, &params, right_stick_axes(0.8, 0.1), 20);
         let scrolls = collect_scroll_effects(&effects);
 
         assert!(!scrolls.is_empty(), "should produce scroll effects");
@@ -963,7 +989,8 @@ mod tests {
         let params = scroll_params(true, false); // horizontal=true, axis_lock=false
 
         // Push stick diagonally
-        let effects = tick_scroll_n(&mut proc, &params, right_stick_axes(0.5, 0.5), 20);
+        let effects =
+            tick_scroll_n(&mut proc, &params, right_stick_axes(0.5, 0.5), 20);
         let scrolls = collect_scroll_effects(&effects);
 
         assert!(!scrolls.is_empty(), "should produce scroll effects");
@@ -983,7 +1010,11 @@ mod tests {
 
         // Simulate 2ms ticks — 100 ticks = 200ms, plenty of time to ramp up
         let effects = tick_scroll_n_dt(
-            &mut proc, &params, right_stick_axes(0.0, 0.8), 100, 0.002,
+            &mut proc,
+            &params,
+            right_stick_axes(0.0, 0.8),
+            100,
+            0.002,
         );
         let scrolls = collect_scroll_effects(&effects);
 
@@ -1005,7 +1036,8 @@ mod tests {
         let params = scroll_params(false, false);
 
         // Scroll down
-        let effects1 = tick_scroll_n(&mut proc, &params, right_stick_axes(0.0, 0.8), 20);
+        let effects1 =
+            tick_scroll_n(&mut proc, &params, right_stick_axes(0.0, 0.8), 20);
         let scrolls1 = collect_scroll_effects(&effects1);
         assert!(!scrolls1.is_empty(), "initial scroll should work");
 
@@ -1013,7 +1045,8 @@ mod tests {
         tick_scroll_n(&mut proc, &params, right_stick_axes(0.0, 0.0), 2);
 
         // Scroll up — should start quickly
-        let effects2 = tick_scroll_n(&mut proc, &params, right_stick_axes(0.0, -0.8), 20);
+        let effects2 =
+            tick_scroll_n(&mut proc, &params, right_stick_axes(0.0, -0.8), 20);
         let scrolls2 = collect_scroll_effects(&effects2);
         assert!(
             !scrolls2.is_empty(),
@@ -1027,12 +1060,16 @@ mod tests {
         let params = scroll_params(false, false); // horizontal=false
 
         // Push stick diagonally
-        let effects = tick_scroll_n(&mut proc, &params, right_stick_axes(0.5, 0.8), 20);
+        let effects =
+            tick_scroll_n(&mut proc, &params, right_stick_axes(0.5, 0.8), 20);
         let scrolls = collect_scroll_effects(&effects);
 
         assert!(!scrolls.is_empty(), "should produce scroll effects");
         for (h, _v) in &scrolls {
-            assert_eq!(*h, 0.0, "horizontal scroll should be zero when horizontal=false");
+            assert_eq!(
+                *h, 0.0,
+                "horizontal scroll should be zero when horizontal=false"
+            );
         }
     }
 }

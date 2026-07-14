@@ -1,7 +1,6 @@
-use enigo::{
-    Axis, Button, Coordinate, Direction, Enigo, InputResult, Mouse, NewConError,
-    Settings,
-};
+use enigo::{Axis, Button, Direction, Enigo, InputResult, Mouse, NewConError, Settings};
+#[cfg(not(target_os = "macos"))]
+use enigo::Coordinate;
 
 use crate::KeyCombo;
 
@@ -47,14 +46,71 @@ mod cg_source {
         SOURCE.with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
-                let src = CGEventSource::new(
-                    CGEventSourceStateID::CombinedSessionState,
-                )
-                .map_err(|_| "failed to create CGEventSource")?;
+                let src =
+                    CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+                        .map_err(|_| "failed to create CGEventSource")?;
                 *slot = Some(src);
             }
             Ok(f(slot.as_ref().expect("CGEventSource initialized above")))
         })
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod relative_mouse {
+    use core_graphics::{
+        display::CGPoint,
+        event::{
+            CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
+            EventField,
+        },
+    };
+    use enigo::{InputError, InputResult};
+    use objc2_app_kit::NSEvent;
+
+    /// Post a relative move while preserving Enigo's macOS semantics.
+    ///
+    /// The live cursor position and pressed buttons are intentionally queried
+    /// for every event. Only the display height is cached by `Performer`;
+    /// querying it through `CGDisplayPixelsHigh` on every tick can block on
+    /// WindowServer for milliseconds under graphics load.
+    pub fn post(dx: i32, dy: i32, display_height: i32) -> InputResult<()> {
+        let pressed = unsafe { NSEvent::pressedMouseButtons() };
+        let point = unsafe { NSEvent::mouseLocation() };
+        let current_x = point.x as i32;
+        let current_y = display_height - point.y as i32;
+
+        let (event_type, button) = if pressed & 1 > 0 {
+            (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+        } else if pressed & 2 > 0 {
+            (CGEventType::RightMouseDragged, CGMouseButton::Right)
+        } else {
+            (CGEventType::MouseMoved, CGMouseButton::Left)
+        };
+
+        let destination = CGPoint::new(
+            f64::from(current_x.saturating_add(dx)),
+            f64::from(current_y.saturating_add(dy)),
+        );
+        let event = super::cg_source::with(|source| {
+            CGEvent::new_mouse_event(source.clone(), event_type, destination, button)
+        })
+        .map_err(|_| InputError::Simulate("failed to create mouse source"))?
+        .map_err(|_| InputError::Simulate("failed creating relative mouse event"))?;
+
+        event
+            .set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
+        event
+            .set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
+        event.set_integer_value_field(
+            EventField::EVENT_SOURCE_USER_DATA,
+            enigo::EVENT_MARKER as i64,
+        );
+        let mut flags = CGEventFlags::CGEventFlagNonCoalesced;
+        flags.insert(CGEventFlags::from_bits_retain(0x2000_0000));
+        event.set_flags(flags);
+        event.post(CGEventTapLocation::HID);
+        Ok(())
     }
 }
 
@@ -156,11 +212,9 @@ mod smooth_scroll {
     };
 
     use enigo::{Axis, InputError, InputResult};
-    use log::info;
-    use std::time::Instant;
+    use log::debug;
 
     pub fn post(axis: Axis, value: f64) -> InputResult<()> {
-        let started_at = Instant::now();
         // Use cached thread-local CGEventSource (see `cg_source` module above)
         // to avoid allocating a fresh source per event.
         let event = super::cg_source::with(|source| {
@@ -190,7 +244,7 @@ mod smooth_scroll {
             Axis::Horizontal => (0, 0, 0, fixed_value, 0, point_value),
         };
 
-        info!(
+        debug!(
             "[smooth_scroll] axis={axis:?} input={value:.3} delta1={} delta2={} fixed1={} fixed2={} point1={} point2={}",
             delta_axis_1,
             delta_axis_2,
@@ -225,16 +279,15 @@ mod smooth_scroll {
             point_axis_2,
         );
         event.post(CGEventTapLocation::HID);
-        info!(
-            "[smooth_scroll] posted axis={axis:?} input={value:.3} elapsed_us={}",
-            started_at.elapsed().as_micros()
-        );
+        debug!("[smooth_scroll] posted axis={axis:?} input={value:.3}");
         Ok(())
     }
 }
 
 pub struct Performer {
     enigo: Enigo,
+    #[cfg(target_os = "macos")]
+    display_height: i32,
 }
 
 // SAFETY: This is safe because we're only accessing Enigo through a Mutex,
@@ -248,7 +301,14 @@ impl Performer {
     pub fn new() -> Result<Self, NewConError> {
         let settings = Settings::default();
         let enigo = Enigo::new(&settings)?;
-        Ok(Self { enigo })
+        #[cfg(target_os = "macos")]
+        let display_height =
+            core_graphics::display::CGDisplay::main().pixels_high() as i32;
+        Ok(Self {
+            enigo,
+            #[cfg(target_os = "macos")]
+            display_height,
+        })
     }
 
     /// Perform key combo.
@@ -268,6 +328,13 @@ impl Performer {
     }
 
     /// Move mouse.
+    #[cfg(target_os = "macos")]
+    pub fn mouse_move(&mut self, x: i32, y: i32) -> InputResult<()> {
+        with_pool(|| relative_mouse::post(x, y, self.display_height))
+    }
+
+    /// Fallback for non-macOS systems.
+    #[cfg(not(target_os = "macos"))]
     pub fn mouse_move(&mut self, x: i32, y: i32) -> InputResult<()> {
         with_pool(|| self.enigo.move_mouse(x, y, Coordinate::Rel))
     }

@@ -5,6 +5,7 @@ testdata/profile.yaml
 /gc_profile.yaml
 .supercode
 
-# Dolt database files (added by bd init)
-.dolt/
+# Local br SQLite database; portable issue state is .beads/issues.jsonl.
 *.db
+# br doctor per-run artifacts
+.doctor/

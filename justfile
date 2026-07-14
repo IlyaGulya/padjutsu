@@ -66,6 +66,10 @@ format:
 bench *ARGS:
   cargo bench {{ARGS}}
 
+[group: 'diagnostics']
+measure-latency duration='15':
+  ./scripts/measure-macos-latency.sh {{duration}}
+
 qa: lint check-formatting test
 
 # Memory testing
