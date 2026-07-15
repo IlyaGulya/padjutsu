@@ -6,7 +6,9 @@ use colored::Colorize;
 
 use padjutsu_control::KeyCombo;
 use padjutsu_bit_mask::Bitmask;
-use padjutsu_gamepad::{Button, ControllerId, ControllerInfo, Axis as CtrlAxis};
+use padjutsu_gamepad::{
+    Axis as CtrlAxis, AxisSnapshot, Button, ControllerId, ControllerInfo,
+};
 use padjutsu_workspace::{
     ButtonAction, ControllerSettings, Profile, StickMode, StickSide,
 };
@@ -230,6 +232,44 @@ impl Padjutsu {
                 "axis motion ignored for unknown controller={id} axis={axis:?}"
             );
         }
+    }
+
+    /// Replace queued axis history with the latest state read directly by the
+    /// gamepad runtime. Returns true when stale local state was corrected.
+    pub fn sync_axis_snapshot(
+        &mut self,
+        id: ControllerId,
+        axes: AxisSnapshot,
+    ) -> bool {
+        let Some(state) = self.controllers.get_mut(&id) else {
+            return false;
+        };
+        if state.axes == axes {
+            return false;
+        }
+        state.axes = axes;
+        true
+    }
+
+    pub fn has_active_mouse_axis_input(&self) -> bool {
+        let Some(bindings) = self.get_compiled_stick_rules() else {
+            return false;
+        };
+        self.controllers.values().any(|state| {
+            let left_active = bindings.left().is_some_and(|mode| match mode {
+                StickMode::MouseMove(params) => {
+                    state.axes[0].hypot(state.axes[1]) >= params.deadzone
+                }
+                _ => false,
+            });
+            let right_active = bindings.right().is_some_and(|mode| match mode {
+                StickMode::MouseMove(params) => {
+                    state.axes[2].hypot(state.axes[3]) >= params.deadzone
+                }
+                _ => false,
+            });
+            left_active || right_active
+        })
     }
 
     pub fn on_controller_disconnected(&mut self, id: ControllerId) {
@@ -761,5 +801,40 @@ impl Padjutsu {
         if matches!(self.binding.source(), BindingSource::Blacklisted) {
             self.button_repeats.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod axis_snapshot_tests {
+    use super::*;
+
+    fn controller_info(id: ControllerId) -> ControllerInfo {
+        ControllerInfo {
+            id,
+            name: "test controller".into(),
+            supports_rumble: false,
+            vendor_id: 1,
+            product_id: 1,
+        }
+    }
+
+    #[test]
+    fn authoritative_neutral_snapshot_clears_stale_axis_motion() {
+        let mut padjutsu = Padjutsu::new();
+        padjutsu.add_controller(controller_info(7));
+        padjutsu.on_axis_motion(7, CtrlAxis::LeftX, 0.75);
+        assert!(padjutsu.controller_stick_has_axis_activity(
+            7,
+            StickSide::Left,
+            0.05
+        ));
+
+        assert!(padjutsu.sync_axis_snapshot(7, [0.0; CtrlAxis::ALL.len()]));
+        assert!(!padjutsu.controller_stick_has_axis_activity(
+            7,
+            StickSide::Left,
+            0.05
+        ));
+        assert!(!padjutsu.sync_axis_snapshot(7, [0.0; CtrlAxis::ALL.len()]));
     }
 }

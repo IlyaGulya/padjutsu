@@ -34,6 +34,10 @@ impl<'a> ActionRunner<'a> {
         }
     }
 
+    pub fn cancel_mouse_motion(&self) {
+        self.worker.cancel_mouse_motion();
+    }
+
     pub fn run_effect(&mut self, effect: Effect) {
         match effect {
             Effect::KeyTap(k) => {

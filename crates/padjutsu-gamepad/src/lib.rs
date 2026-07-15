@@ -12,7 +12,7 @@ pub use crate::events::{ControllerEvent, EventReceiver};
 pub use crate::handle::ControllerHandle;
 pub use crate::manager::ControllerManager;
 pub use crate::runtime::set_realtime_priority;
-pub use crate::types::{Button, ControllerId, ControllerInfo, Axis};
+pub use crate::types::{Axis, AxisSnapshot, Button, ControllerId, ControllerInfo};
 
 /// Error type for controller management operations.
 #[derive(Debug, Error)]

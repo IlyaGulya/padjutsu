@@ -37,6 +37,10 @@ impl WakeState {
     pub fn record_timer_wake(&mut self, now: Instant) {
         self.metrics.record(now, self.next_tick_due);
     }
+
+    pub fn record_axis_snapshot_corrections(&mut self, count: u64) {
+        self.metrics.axis_snapshot_corrections += count;
+    }
 }
 
 const WAKE_LATENCY_BUCKETS_US: [u64; 12] = [
@@ -69,6 +73,7 @@ struct WakeMetrics {
     over_4ms: u64,
     over_8ms: u64,
     over_16ms: u64,
+    axis_snapshot_corrections: u64,
 }
 
 impl WakeMetrics {
@@ -88,6 +93,7 @@ impl WakeMetrics {
             over_4ms: 0,
             over_8ms: 0,
             over_16ms: 0,
+            axis_snapshot_corrections: 0,
         }
     }
 
@@ -147,7 +153,7 @@ impl WakeMetrics {
             self.lateness_total_us / u128::from(self.lateness_samples)
         };
         eprintln!(
-            "[wake-metrics] window_ms={} wakes={} tick_wakes={} early_wakes={} lateness_us(n={},avg={},p95~{},p99~{},max={}) over_1ms={} over_4ms={} over_8ms={} over_16ms={}",
+            "[wake-metrics] window_ms={} wakes={} tick_wakes={} early_wakes={} lateness_us(n={},avg={},p95~{},p99~{},max={}) over_1ms={} over_4ms={} over_8ms={} over_16ms={} axis_snapshot_corrections={}",
             self.started_at.elapsed().as_millis(),
             self.wakes,
             self.tick_wakes,
@@ -161,6 +167,7 @@ impl WakeMetrics {
             self.over_4ms,
             self.over_8ms,
             self.over_16ms,
+            self.axis_snapshot_corrections,
         );
         *self = Self::new();
     }

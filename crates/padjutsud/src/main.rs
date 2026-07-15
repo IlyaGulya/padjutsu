@@ -235,6 +235,12 @@ fn process_overdue_wake(
     manager: &ControllerManager,
     wake_state: &mut WakeState,
 ) -> DomainControl {
+    let mouse_was_active = padjutsu.has_active_mouse_axis_input();
+    let corrections = sync_latest_controller_axes(padjutsu, manager);
+    wake_state.record_axis_snapshot_corrections(corrections);
+    if mouse_was_active && !padjutsu.has_active_mouse_axis_input() {
+        action_runner.cancel_mouse_motion();
+    }
     let Some(event) =
         overdue_wake_event(padjutsu, wake_state, std::time::Instant::now())
     else {
@@ -254,11 +260,33 @@ fn dispatch_domain_event(
     manager: &ControllerManager,
     wake_state: &mut WakeState,
 ) -> DomainControl {
+    let mouse_was_active = padjutsu.has_active_mouse_axis_input();
     if matches!(&event, DomainEvent::Timer(TimerEvent::Wake)) {
+        let corrections = sync_latest_controller_axes(padjutsu, manager);
+        wake_state.record_axis_snapshot_corrections(corrections);
         wake_state.record_timer_wake(std::time::Instant::now());
     }
     let step = reduce_event(event, padjutsu, manager, runtime_state, wake_state);
+    if mouse_was_active && !padjutsu.has_active_mouse_axis_input() {
+        action_runner.cancel_mouse_motion();
+    }
     apply_domain_step(step, runtime_state, action_runner, wake_state)
+}
+
+fn sync_latest_controller_axes(
+    padjutsu: &mut Padjutsu,
+    manager: &ControllerManager,
+) -> u64 {
+    let mut corrections = 0_u64;
+    manager.for_each_axis_snapshot(|id, axes| {
+        corrections += u64::from(padjutsu.sync_axis_snapshot(id, axes));
+    });
+    if corrections > 0 {
+        print_debug!(
+            "latest-axis snapshot corrected {corrections} queued controller states"
+        );
+    }
+    corrections
 }
 
 fn dispatch_and_process_overdue(

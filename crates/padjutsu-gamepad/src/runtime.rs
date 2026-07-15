@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use ahash::{AHashMap, AHashSet};
@@ -13,7 +13,17 @@ use crate::command::Command;
 use crate::events::ControllerEvent;
 use crate::manager::Inner;
 use crate::metrics::Metrics;
-use crate::types::{Button, ControllerId, ControllerInfo, Axis};
+use crate::types::{Axis, AxisSnapshot, Button, ControllerId, ControllerInfo};
+
+const AXIS_POLL_INTERVAL: Duration = Duration::from_millis(8);
+const SDL_AXES: [SdlAxis; 6] = [
+    SdlAxis::LeftX,
+    SdlAxis::LeftY,
+    SdlAxis::RightX,
+    SdlAxis::RightY,
+    SdlAxis::TriggerLeft,
+    SdlAxis::TriggerRight,
+];
 
 // --- Mach real-time thread priority via raw FFI ---
 
@@ -160,6 +170,7 @@ pub(crate) fn start_runtime_thread(
             AHashMap::new();
         let mut button_state: AHashMap<ControllerId, AHashSet<Button>> =
             AHashMap::new();
+        let mut last_axis_poll = Instant::now() - AXIS_POLL_INTERVAL;
 
         // Initial enumeration
         if let Ok(num_joysticks) = joystick_subsystem.num_joysticks() {
@@ -517,6 +528,13 @@ pub(crate) fn start_runtime_thread(
                 }
             }
 
+            poll_axis_snapshots(
+                &inner,
+                &controllers,
+                &mut last_axis_poll,
+                Instant::now(),
+            );
+
             metrics_tick();
         }
     });
@@ -554,12 +572,57 @@ fn map_sdl_axis(axis: SdlAxis) -> Option<Axis> {
     })
 }
 
+fn poll_axis_snapshots(
+    inner: &Inner,
+    controllers: &AHashMap<ControllerId, GameController>,
+    last_poll: &mut Instant,
+    now: Instant,
+) {
+    if now.saturating_duration_since(*last_poll) < AXIS_POLL_INTERVAL {
+        return;
+    }
+    *last_poll = now;
+
+    let polled: Vec<(ControllerId, AxisSnapshot)> = controllers
+        .iter()
+        .map(|(id, controller)| {
+            let mut axes = [0.0; Axis::ALL.len()];
+            for (index, axis) in SDL_AXES.iter().copied().enumerate() {
+                axes[index] = f32::from(controller.axis(axis)) / f32::from(i16::MAX);
+            }
+            (*id, axes)
+        })
+        .collect();
+
+    if let Ok(mut snapshots) = inner.controller_axes.write() {
+        for (id, axes) in polled {
+            snapshots.insert(id, axes);
+        }
+    }
+}
+
 thread_local! {
     static METRICS: std::cell::RefCell<Metrics> = std::cell::RefCell::new(Metrics::default());
 }
 
 fn broadcast(inner: &Inner, event: ControllerEvent) {
     use crossbeam_channel::TrySendError;
+    if let Ok(mut snapshots) = inner.controller_axes.write() {
+        match &event {
+            ControllerEvent::Connected(info) => {
+                snapshots.entry(info.id).or_insert([0.0; Axis::ALL.len()]);
+            }
+            ControllerEvent::Disconnected(id) => {
+                snapshots.remove(id);
+            }
+            ControllerEvent::AxisMotion { id, axis, value } => {
+                snapshots.entry(*id).or_insert([0.0; Axis::ALL.len()])
+                    [axis.index()] = *value;
+            }
+            ControllerEvent::ButtonPressed { .. }
+            | ControllerEvent::ButtonReleased { .. } => {}
+        }
+    }
     if crate::metrics::is_enabled() {
         METRICS.with(|m| {
             let mut m = m.borrow_mut();
@@ -606,5 +669,38 @@ fn metrics_tick() {
             metrics.record_loop_tick(Instant::now());
             metrics.maybe_report();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, RwLock};
+
+    use crossbeam_channel::{bounded, unbounded};
+
+    use super::*;
+
+    #[test]
+    fn latest_axis_snapshot_bypasses_a_full_subscriber_queue() {
+        let (cmd_tx, _cmd_rx) = unbounded();
+        let (subscriber_tx, _subscriber_rx) = bounded(0);
+        let inner = Inner {
+            subscribers: Mutex::new(vec![subscriber_tx]),
+            controllers_info: RwLock::new(AHashMap::new()),
+            controller_axes: RwLock::new(AHashMap::new()),
+            cmd_tx,
+        };
+
+        broadcast(
+            &inner,
+            ControllerEvent::AxisMotion {
+                id: 7,
+                axis: Axis::LeftX,
+                value: 0.75,
+            },
+        );
+
+        let snapshots = inner.controller_axes.read().unwrap();
+        assert_eq!(snapshots[&7][Axis::LeftX.index()], 0.75);
     }
 }

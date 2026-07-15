@@ -9,12 +9,13 @@ use crate::Result;
 use crate::events::{ControllerEvent, EventReceiver};
 use crate::handle::ControllerHandle;
 use crate::runtime::start_runtime_thread;
-use crate::types::{ControllerId, ControllerInfo};
+use crate::types::{AxisSnapshot, ControllerId, ControllerInfo};
 
 /// Shared state used by the manager, the runtime loop and controller handles.
 pub(crate) struct Inner {
     pub subscribers: Mutex<Vec<Sender<ControllerEvent>>>,
     pub controllers_info: RwLock<AHashMap<ControllerId, ControllerInfo>>,
+    pub controller_axes: RwLock<AHashMap<ControllerId, AxisSnapshot>>,
     pub cmd_tx: Sender<Command>,
 }
 
@@ -31,6 +32,7 @@ impl ControllerManager {
         let inner = Arc::new(Inner {
             subscribers: Mutex::new(Vec::new()),
             controllers_info: RwLock::new(AHashMap::new()),
+            controller_axes: RwLock::new(AHashMap::new()),
             cmd_tx,
         });
 
@@ -64,6 +66,28 @@ impl ControllerManager {
             return map.values().cloned().collect();
         }
         Vec::new()
+    }
+
+    /// Returns the latest axis state observed directly by the SDL runtime.
+    /// This state is independent of the event subscriber queue, so consumers
+    /// can skip historical motion and recover from a dropped neutral event.
+    pub fn axis_snapshots(&self) -> Vec<(ControllerId, AxisSnapshot)> {
+        if let Ok(map) = self.inner.controller_axes.read() {
+            return map.iter().map(|(id, axes)| (*id, *axes)).collect();
+        }
+        Vec::new()
+    }
+
+    /// Visits the latest axis snapshots without allocating a per-tick buffer.
+    pub fn for_each_axis_snapshot(
+        &self,
+        mut visitor: impl FnMut(ControllerId, AxisSnapshot),
+    ) {
+        if let Ok(map) = self.inner.controller_axes.read() {
+            for (id, axes) in map.iter() {
+                visitor(*id, *axes);
+            }
+        }
     }
 
     /// Returns a handle to a controller by id if it is currently known.

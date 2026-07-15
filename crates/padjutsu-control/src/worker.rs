@@ -47,6 +47,7 @@ pub struct PerformerWorker {
     tx: Sender<QueuedCmd>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
+    mouse_generation: Arc<AtomicU64>,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -59,19 +60,22 @@ impl PerformerWorker {
         let stop_w = stop.clone();
         let dropped = Arc::new(AtomicU64::new(0));
         let dropped_w = dropped.clone();
+        let mouse_generation = Arc::new(AtomicU64::new(0));
+        let mouse_generation_w = mouse_generation.clone();
         let join = thread::Builder::new()
             .name("performer-worker".into())
             .stack_size(512 * 1024)
             .spawn(move || {
                 #[cfg(target_os = "macos")]
                 set_realtime_priority_2ms();
-                run(&mut performer, rx, stop_w, dropped_w);
+                run(&mut performer, rx, stop_w, dropped_w, mouse_generation_w);
             })
             .expect("failed to spawn performer worker");
         Self {
             tx,
             stop,
             dropped,
+            mouse_generation,
             join: Some(join),
         }
     }
@@ -87,6 +91,7 @@ impl PerformerWorker {
         let queued = QueuedCmd {
             cmd,
             enqueued_at: Instant::now(),
+            mouse_generation: self.mouse_generation.load(Ordering::Acquire),
         };
         match self.tx.try_send(queued) {
             Ok(()) => Ok(()),
@@ -99,6 +104,12 @@ impl PerformerWorker {
             }
         }
     }
+
+    /// Invalidates mouse movement already waiting behind a slow system post.
+    /// The next fresh movement command automatically uses the new generation.
+    pub fn cancel_mouse_motion(&self) {
+        self.mouse_generation.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 impl Drop for PerformerWorker {
@@ -108,6 +119,7 @@ impl Drop for PerformerWorker {
         let _ = self.tx.try_send(QueuedCmd {
             cmd: PerformerCmd::MouseMove { dx: 0, dy: 0 },
             enqueued_at: Instant::now(),
+            mouse_generation: self.mouse_generation.load(Ordering::Acquire),
         });
         if let Some(j) = self.join.take() {
             let _ = j.join();
@@ -119,6 +131,16 @@ impl Drop for PerformerWorker {
 struct QueuedCmd {
     cmd: PerformerCmd,
     enqueued_at: Instant,
+    mouse_generation: u64,
+}
+
+const MAX_CATCH_UP_DELTA_AXIS: i32 = 32;
+
+fn clamp_mouse_catch_up(dx: i32, dy: i32) -> (i32, i32) {
+    (
+        dx.clamp(-MAX_CATCH_UP_DELTA_AXIS, MAX_CATCH_UP_DELTA_AXIS),
+        dy.clamp(-MAX_CATCH_UP_DELTA_AXIS, MAX_CATCH_UP_DELTA_AXIS),
+    )
 }
 
 fn run(
@@ -126,6 +148,7 @@ fn run(
     rx: Receiver<QueuedCmd>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
+    mouse_generation: Arc<AtomicU64>,
 ) {
     let mut metrics = WorkerMetrics::new(metrics_enabled(), dropped);
     while !stop.load(Ordering::Acquire) {
@@ -144,7 +167,7 @@ fn run(
         }
 
         metrics.record_batch(&batch);
-        execute_batch(performer, &batch, &mut metrics);
+        execute_batch(performer, &batch, &mouse_generation, &mut metrics);
         metrics.maybe_report(rx.len());
     }
 }
@@ -154,6 +177,7 @@ fn run(
 fn execute_batch(
     performer: &mut Performer,
     batch: &[QueuedCmd],
+    mouse_generation: &AtomicU64,
     metrics: &mut WorkerMetrics,
 ) {
     let mut i = 0;
@@ -162,32 +186,51 @@ fn execute_batch(
             PerformerCmd::MouseMove { .. } => {
                 // Coalesce all subsequent MouseMove commands into a single delta.
                 let segment_start = i;
+                let current_generation = mouse_generation.load(Ordering::Acquire);
                 let mut sum_dx: i32 = 0;
                 let mut sum_dy: i32 = 0;
+                let mut valid_commands = 0_usize;
                 while i < batch.len() {
                     if let PerformerCmd::MouseMove { dx, dy } = batch[i].cmd {
-                        sum_dx = sum_dx.saturating_add(dx);
-                        sum_dy = sum_dy.saturating_add(dy);
+                        if batch[i].mouse_generation == current_generation {
+                            sum_dx = sum_dx.saturating_add(dx);
+                            sum_dy = sum_dy.saturating_add(dy);
+                            valid_commands += 1;
+                        }
                         i += 1;
                     } else {
                         break;
                     }
                 }
-                if sum_dx != 0 || sum_dy != 0 {
+                let segment_commands = i - segment_start;
+                metrics.record_cancelled_mouse_commands(
+                    segment_commands.saturating_sub(valid_commands),
+                );
+                if mouse_generation.load(Ordering::Acquire) != current_generation {
+                    metrics.record_cancelled_mouse_commands(valid_commands);
+                    valid_commands = 0;
+                }
+                let original_dx = sum_dx;
+                let original_dy = sum_dy;
+                (sum_dx, sum_dy) = clamp_mouse_catch_up(sum_dx, sum_dy);
+                metrics.record_clamped_mouse_post(
+                    sum_dx != original_dx || sum_dy != original_dy,
+                );
+                if valid_commands > 0 && (sum_dx != 0 || sum_dy != 0) {
                     let started_at = metrics.start_execution();
                     let observation =
                         performer.mouse_move_observed(sum_dx, sum_dy).ok().flatten();
                     metrics.record_mouse(
                         sum_dx,
                         sum_dy,
-                        i - segment_start,
+                        valid_commands,
                         batch[segment_start].enqueued_at,
                         started_at,
                         observation,
                     );
                     metrics.record_execution(ExecutionKind::Mouse, started_at);
                 }
-                metrics.record_coalesced(i - segment_start - 1);
+                metrics.record_coalesced(segment_commands.saturating_sub(1));
             }
             PerformerCmd::ScrollX(_) => {
                 let segment_start = i;
@@ -432,6 +475,8 @@ struct WorkerMetrics {
     cursor_stalled: u64,
     mouse_posts: u64,
     mouse_commands: u64,
+    cancelled_mouse_commands: u64,
+    clamped_mouse_posts: u64,
     max_mouse_commands_per_post: usize,
     last_mouse_post_at: Option<Instant>,
     last_mouse_delta: Option<(i32, i32)>,
@@ -467,6 +512,8 @@ impl WorkerMetrics {
             cursor_stalled: 0,
             mouse_posts: 0,
             mouse_commands: 0,
+            cancelled_mouse_commands: 0,
+            clamped_mouse_posts: 0,
             max_mouse_commands_per_post: 0,
             last_mouse_post_at: None,
             last_mouse_delta: None,
@@ -583,13 +630,25 @@ impl WorkerMetrics {
         }
     }
 
+    fn record_cancelled_mouse_commands(&mut self, count: usize) {
+        if self.enabled {
+            self.cancelled_mouse_commands += count as u64;
+        }
+    }
+
+    fn record_clamped_mouse_post(&mut self, clamped: bool) {
+        if self.enabled && clamped {
+            self.clamped_mouse_posts += 1;
+        }
+    }
+
     fn maybe_report(&mut self, queue_len: usize) {
         if !self.enabled || self.started_at.elapsed() < self.report_interval {
             return;
         }
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         eprintln!(
-            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} mouse_posts={} mouse_commands={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
+            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
             self.started_at.elapsed().as_millis(),
             self.batches,
             self.commands,
@@ -613,6 +672,8 @@ impl WorkerMetrics {
             self.cursor_stalled,
             self.mouse_posts,
             self.mouse_commands,
+            self.cancelled_mouse_commands,
+            self.clamped_mouse_posts,
             self.max_mouse_commands_per_post,
             self.scroll_post.summary(),
             self.other_execution.summary(),
@@ -719,6 +780,35 @@ fn set_realtime_priority_2ms() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelling_mouse_motion_invalidates_already_queued_commands() {
+        let (tx, rx) = bounded(4);
+        let worker = PerformerWorker {
+            tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            mouse_generation: Arc::new(AtomicU64::new(0)),
+            join: None,
+        };
+
+        worker
+            .try_send(PerformerCmd::MouseMove { dx: 10, dy: 0 })
+            .unwrap();
+        worker.cancel_mouse_motion();
+        worker
+            .try_send(PerformerCmd::MouseMove { dx: 2, dy: 0 })
+            .unwrap();
+
+        assert_eq!(rx.recv().unwrap().mouse_generation, 0);
+        assert_eq!(rx.recv().unwrap().mouse_generation, 1);
+    }
+
+    #[test]
+    fn catch_up_delta_is_bounded_after_a_system_stall() {
+        assert_eq!(clamp_mouse_catch_up(125, -80), (32, -32));
+        assert_eq!(clamp_mouse_catch_up(23, -12), (23, -12));
+    }
 
     #[test]
     fn coalesce_mouse_moves_sums_deltas() {

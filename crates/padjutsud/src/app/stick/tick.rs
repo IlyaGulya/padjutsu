@@ -591,9 +591,16 @@ impl StickProcessor {
             Self::mouse_smoothing_alpha(dt_s, params.runtime.smoothing_window_ms);
         let (x0, y0) = axes_for_side(axes, stick_side);
         let (raw_x, raw_y) = invert_xy(x0, y0, params.invert_x, params.invert_y);
-        // Let the filter track raw input freely — never reset it.
-        // This allows smooth zero-crossing during direction reversals
-        // without getting trapped by the deadzone threshold.
+        if magnitude2d(raw_x, raw_y) < params.deadzone {
+            // Neutral input is a hard stop, not another smoothing target. A
+            // decaying filter would otherwise keep creating motion after the
+            // user released the stick, especially behind a blocked CGEventPost.
+            side.mouse_filtered = (0.0, 0.0);
+            side.mouse_accum = (0.0, 0.0);
+            return;
+        }
+        // While input is active, let the filter track it freely. This keeps
+        // direction changes smooth without extending motion past neutral.
         side.mouse_filtered.0 += alpha * (raw_x - side.mouse_filtered.0);
         side.mouse_filtered.1 += alpha * (raw_y - side.mouse_filtered.1);
         let (x, y) = side.mouse_filtered;
@@ -886,7 +893,9 @@ impl StickProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use padjutsu_workspace::{ScrollParams, ScrollRuntimeParams};
+    use padjutsu_workspace::{
+        MouseParams, MouseRuntimeParams, ScrollParams, ScrollRuntimeParams,
+    };
 
     fn scroll_params(horizontal: bool, axis_lock: bool) -> ScrollParams {
         ScrollParams {
@@ -1118,5 +1127,45 @@ mod tests {
         let dt_s = processor.tick_dt_s(now, 0.008);
 
         assert!((dt_s - 0.008).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn neutral_mouse_input_clears_filter_without_emitting_a_tail() {
+        let params = MouseParams {
+            deadzone: 0.15,
+            outer_deadzone: 0.05,
+            max_speed_px_s: 1_000.0,
+            gamma: 1.0,
+            precision_multiplier: 0.25,
+            precision_button: None,
+            invert_x: false,
+            invert_y: false,
+            runtime: MouseRuntimeParams {
+                tick_ms: 8,
+                smoothing_window_ms: 35,
+            },
+        };
+        let mut side = SideRepeatState {
+            mouse_filtered: (0.9, 0.4),
+            mouse_accum: (0.8, 0.3),
+            ..SideRepeatState::default()
+        };
+        let mut effects = Vec::new();
+        let mut perf = MousePerfFrame::default();
+
+        StickProcessor::tick_mouse_side(
+            0.008,
+            &params,
+            [0.0; 6],
+            &StickSide::Left,
+            &mut side,
+            false,
+            &mut |effect| effects.push(effect),
+            &mut perf,
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(side.mouse_filtered, (0.0, 0.0));
+        assert_eq!(side.mouse_accum, (0.0, 0.0));
     }
 }
