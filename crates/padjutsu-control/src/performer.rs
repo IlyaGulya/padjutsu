@@ -76,6 +76,14 @@ mod relative_mouse {
 
     use super::MouseMoveObservation;
 
+    /// Mouse moves must remain coalescible. Under WindowServer load,
+    /// non-coalesced events form a downstream queue that can keep moving the
+    /// cursor after the stick has already returned to neutral.
+    #[inline]
+    fn movement_event_flags() -> CGEventFlags {
+        CGEventFlags::empty()
+    }
+
     /// Post a relative move while preserving Enigo's macOS semantics.
     ///
     /// The live cursor position and pressed buttons are intentionally queried
@@ -118,14 +126,24 @@ mod relative_mouse {
             EventField::EVENT_SOURCE_USER_DATA,
             enigo::EVENT_MARKER as i64,
         );
-        let mut flags = CGEventFlags::CGEventFlagNonCoalesced;
-        flags.insert(CGEventFlags::from_bits_retain(0x2000_0000));
-        event.set_flags(flags);
+        event.set_flags(movement_event_flags());
         event.post(CGEventTapLocation::HID);
         Ok(MouseMoveObservation {
             x: current_x,
             y: current_y,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn movement_events_allow_window_server_coalescing() {
+            let flags = movement_event_flags();
+            assert!(!flags.contains(CGEventFlags::CGEventFlagNonCoalesced));
+            assert_eq!(flags.bits() & 0x2000_0000, 0);
+        }
     }
 }
 
