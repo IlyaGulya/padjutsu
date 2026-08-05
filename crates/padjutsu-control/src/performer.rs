@@ -309,7 +309,45 @@ mod smooth_scroll {
     use enigo::{Axis, InputError, InputResult};
     use log::debug;
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct ScrollEventFields {
+        fixed_axis_1: i64,
+        fixed_axis_2: i64,
+        point_axis_1: i64,
+        point_axis_2: i64,
+        continuous: i64,
+    }
+
+    fn event_fields(
+        horizontal: f64,
+        vertical: f64,
+        continuous: bool,
+    ) -> ScrollEventFields {
+        ScrollEventFields {
+            fixed_axis_1: (vertical * 65536.0).round() as i64,
+            fixed_axis_2: (horizontal * 65536.0).round() as i64,
+            point_axis_1: vertical.round() as i64,
+            point_axis_2: horizontal.round() as i64,
+            continuous: i64::from(continuous),
+        }
+    }
+
     pub fn post(axis: Axis, value: f64) -> InputResult<()> {
+        match axis {
+            Axis::Horizontal => post_values(value, 0.0, false),
+            Axis::Vertical => post_values(0.0, value, false),
+        }
+    }
+
+    pub fn post_trackpad(horizontal: f64, vertical: f64) -> InputResult<()> {
+        post_values(horizontal, vertical, true)
+    }
+
+    fn post_values(
+        horizontal: f64,
+        vertical: f64,
+        continuous: bool,
+    ) -> InputResult<()> {
         // Use cached thread-local CGEventSource (see `cg_source` module above)
         // to avoid allocating a fresh source per event.
         let event = super::cg_source::with(|source| {
@@ -325,57 +363,68 @@ mod smooth_scroll {
         .map_err(|_| InputError::Simulate("failed to create scroll source"))?
         .map_err(|_| InputError::Simulate("failed creating smooth scroll event"))?;
 
-        let fixed_value = (value * 65536.0).round() as i64;
-        let point_value = value.round() as i64;
-        let (
-            delta_axis_1,
-            delta_axis_2,
-            fixed_axis_1,
-            fixed_axis_2,
-            point_axis_1,
-            point_axis_2,
-        ) = match axis {
-            Axis::Vertical => (0, 0, fixed_value, 0, point_value, 0),
-            Axis::Horizontal => (0, 0, 0, fixed_value, 0, point_value),
-        };
+        let fields = event_fields(horizontal, vertical, continuous);
 
         debug!(
-            "[smooth_scroll] axis={axis:?} input={value:.3} delta1={} delta2={} fixed1={} fixed2={} point1={} point2={}",
-            delta_axis_1,
-            delta_axis_2,
-            fixed_axis_1,
-            fixed_axis_2,
-            point_axis_1,
-            point_axis_2
+            "[smooth_scroll] horizontal={horizontal:.3} vertical={vertical:.3} continuous={continuous} fixed1={} fixed2={} point1={} point2={}",
+            fields.fixed_axis_1,
+            fields.fixed_axis_2,
+            fields.point_axis_1,
+            fields.point_axis_2
         );
 
-        event.set_integer_value_field(
-            EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
-            delta_axis_1,
-        );
-        event.set_integer_value_field(
-            EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
-            delta_axis_2,
-        );
+        event
+            .set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1, 0);
+        event
+            .set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2, 0);
         event.set_integer_value_field(
             EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_1,
-            fixed_axis_1,
+            fields.fixed_axis_1,
         );
         event.set_integer_value_field(
             EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_2,
-            fixed_axis_2,
+            fields.fixed_axis_2,
         );
         event.set_integer_value_field(
             EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
-            point_axis_1,
+            fields.point_axis_1,
         );
         event.set_integer_value_field(
             EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
-            point_axis_2,
+            fields.point_axis_2,
+        );
+        event.set_integer_value_field(
+            EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
+            fields.continuous,
+        );
+        event.set_integer_value_field(
+            EventField::EVENT_SOURCE_USER_DATA,
+            enigo::EVENT_MARKER as i64,
         );
         event.post(CGEventTapLocation::HID);
-        debug!("[smooth_scroll] posted axis={axis:?} input={value:.3}");
+        debug!(
+            "[smooth_scroll] posted horizontal={horizontal:.3} vertical={vertical:.3} continuous={continuous}"
+        );
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn trackpad_fields_preserve_both_axes_and_mark_event_continuous() {
+            assert_eq!(
+                event_fields(1.25, -2.5, true),
+                ScrollEventFields {
+                    fixed_axis_1: -163_840,
+                    fixed_axis_2: 81_920,
+                    point_axis_1: -3,
+                    point_axis_2: 1,
+                    continuous: 1,
+                }
+            );
+        }
     }
 }
 
@@ -463,6 +512,17 @@ impl Performer {
         with_pool(|| smooth_scroll::post(Axis::Vertical, value))
     }
 
+    /// Post one continuous, two-axis pixel scroll event, matching a trackpad
+    /// gesture closely enough for browser canvases to pan diagonally.
+    #[cfg(target_os = "macos")]
+    pub fn trackpad_scroll(
+        &mut self,
+        horizontal: f64,
+        vertical: f64,
+    ) -> InputResult<()> {
+        with_pool(|| smooth_scroll::post_trackpad(horizontal, vertical))
+    }
+
     /// Fallback for non-macOS systems
     #[cfg(not(target_os = "macos"))]
     pub fn scroll_x(&mut self, value: f64) -> InputResult<()> {
@@ -472,6 +532,17 @@ impl Performer {
     #[cfg(not(target_os = "macos"))]
     pub fn scroll_y(&mut self, value: f64) -> InputResult<()> {
         self.enigo.scroll(value.round() as i32, Axis::Vertical)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn trackpad_scroll(
+        &mut self,
+        horizontal: f64,
+        vertical: f64,
+    ) -> InputResult<()> {
+        self.enigo
+            .scroll(horizontal.round() as i32, Axis::Horizontal)?;
+        self.enigo.scroll(vertical.round() as i32, Axis::Vertical)
     }
 
     /// Click a mouse button.

@@ -108,6 +108,12 @@ impl<'a> ActionRunner<'a> {
                     self.send(PerformerCmd::ScrollY(v));
                 }
             }
+            Effect::TrackpadScroll { h, v } => {
+                self.send(PerformerCmd::TrackpadScroll {
+                    horizontal: h,
+                    vertical: v,
+                });
+            }
             Effect::Rumble { id, ms } => {
                 print_info!("ACTION: Rumble id={id} ms={ms}");
                 if let Some(h) = self.manager.controller(id) {

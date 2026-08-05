@@ -32,6 +32,10 @@ pub enum PerformerCmd {
     },
     ScrollX(f64),
     ScrollY(f64),
+    TrackpadScroll {
+        horizontal: f64,
+        vertical: f64,
+    },
     MouseClick(Button),
     MouseDoubleClick(Button),
     MousePress(Button),
@@ -140,6 +144,17 @@ fn clamp_mouse_catch_up(dx: i32, dy: i32) -> (i32, i32) {
     (
         dx.clamp(-MAX_CATCH_UP_DELTA_AXIS, MAX_CATCH_UP_DELTA_AXIS),
         dy.clamp(-MAX_CATCH_UP_DELTA_AXIS, MAX_CATCH_UP_DELTA_AXIS),
+    )
+}
+
+fn coalesce_trackpad_scroll(
+    deltas: impl IntoIterator<Item = (f64, f64)>,
+) -> (f64, f64) {
+    deltas.into_iter().fold(
+        (0.0, 0.0),
+        |(horizontal, vertical), (next_horizontal, next_vertical)| {
+            (horizontal + next_horizontal, vertical + next_vertical)
+        },
     )
 }
 
@@ -268,6 +283,33 @@ fn execute_batch(
                 }
                 metrics.record_coalesced(i - segment_start - 1);
             }
+            PerformerCmd::TrackpadScroll { .. } => {
+                let segment_start = i;
+                while i < batch.len()
+                    && matches!(batch[i].cmd, PerformerCmd::TrackpadScroll { .. })
+                {
+                    i += 1;
+                }
+                let (horizontal, vertical) = coalesce_trackpad_scroll(
+                    batch[segment_start..i].iter().filter_map(|queued| {
+                        if let PerformerCmd::TrackpadScroll {
+                            horizontal,
+                            vertical,
+                        } = queued.cmd
+                        {
+                            Some((horizontal, vertical))
+                        } else {
+                            None
+                        }
+                    }),
+                );
+                if horizontal != 0.0 || vertical != 0.0 {
+                    let started_at = metrics.start_execution();
+                    let _ = performer.trackpad_scroll(horizontal, vertical);
+                    metrics.record_execution(ExecutionKind::Scroll, started_at);
+                }
+                metrics.record_coalesced(i - segment_start - 1);
+            }
             // Non-coalescing commands: execute one at a time.
             other => {
                 let started_at = metrics.start_execution();
@@ -298,6 +340,12 @@ fn execute_one(performer: &mut Performer, cmd: &PerformerCmd) {
         }
         PerformerCmd::ScrollY(v) => {
             let _ = performer.scroll_y(*v);
+        }
+        PerformerCmd::TrackpadScroll {
+            horizontal,
+            vertical,
+        } => {
+            let _ = performer.trackpad_scroll(*horizontal, *vertical);
         }
         PerformerCmd::MouseClick(b) => {
             let _ = performer.mouse_click(*b);
@@ -850,6 +898,12 @@ mod tests {
         }
         assert_eq!(sum_dx, 7);
         assert_eq!(sum_dy, 1);
+    }
+
+    #[test]
+    fn coalesce_trackpad_scroll_sums_both_axes() {
+        let deltas = [(1.5, 2.0), (-0.25, 4.0), (3.0, -1.0)];
+        assert_eq!(coalesce_trackpad_scroll(deltas), (4.25, 5.0));
     }
 
     #[test]

@@ -165,6 +165,7 @@ pub enum StickMode {
     Brightness(StepperParams),
     MouseMove(MouseParams),
     Scroll(ScrollParams),
+    TrackpadScroll(ScrollParams),
 }
 
 /// Parameters for the arrows mode.

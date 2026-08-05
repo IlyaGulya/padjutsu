@@ -55,7 +55,10 @@ rules:
 "#;
         let profile = parse_profile(yaml).expect("should parse");
         let rules = profile.rules.get("common").expect("common rules");
-        let right = rules.sticks.get(&crate::StickSide::Right).expect("right stick");
+        let right = rules
+            .sticks
+            .get(&crate::StickSide::Right)
+            .expect("right stick");
         match right {
             StickMode::Scroll(params) => {
                 assert!(params.horizontal);
@@ -78,13 +81,41 @@ rules:
 "#;
         let profile = parse_profile(yaml).expect("should parse");
         let rules = profile.rules.get("common").expect("common rules");
-        let right = rules.sticks.get(&crate::StickSide::Right).expect("right stick");
+        let right = rules
+            .sticks
+            .get(&crate::StickSide::Right)
+            .expect("right stick");
         match right {
             StickMode::Scroll(params) => {
                 assert!(params.horizontal);
                 assert!(!params.axis_lock, "axis_lock should default to false");
             }
             other => panic!("expected Scroll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_trackpad_scroll_defaults_to_free_two_axis_motion() {
+        let yaml = r#"
+version: 1
+rules:
+  common:
+    sticks:
+      right:
+        mode: trackpad_scroll
+"#;
+        let profile = parse_profile(yaml).expect("should parse");
+        let rules = profile.rules.get("common").expect("common rules");
+        let right = rules
+            .sticks
+            .get(&crate::StickSide::Right)
+            .expect("right stick");
+        match right {
+            StickMode::TrackpadScroll(params) => {
+                assert!(params.horizontal);
+                assert!(!params.axis_lock);
+            }
+            other => panic!("expected TrackpadScroll, got {other:?}"),
         }
     }
 }

@@ -31,6 +31,10 @@ pub enum Effect {
         h: f64,
         v: f64,
     },
+    TrackpadScroll {
+        h: f64,
+        v: f64,
+    },
     Rumble {
         id: ControllerId,
         ms: u32,

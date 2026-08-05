@@ -50,6 +50,7 @@ pub(super) struct TickPerfStats {
     pub(super) mouse_chunk_over_16: u64,
     pub(super) mouse_chunk_over_32: u64,
     pub(super) scroll_events: u64,
+    pub(super) trackpad_scroll_events: u64,
     pub(super) last_report_at: Option<Instant>,
 }
 

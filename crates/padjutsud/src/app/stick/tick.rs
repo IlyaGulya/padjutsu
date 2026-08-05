@@ -16,6 +16,12 @@ use super::util::{
     normalize_with_outer_deadzone,
 };
 
+#[derive(Clone, Copy)]
+enum ScrollOutput {
+    Wheel,
+    Trackpad,
+}
+
 #[inline]
 fn trigger_scroll_boost(
     axes: [f32; 6],
@@ -169,6 +175,12 @@ impl StickProcessor {
         if has_scroll {
             self.tick_scroll(dt_s, &mut sink, axes_list, bindings);
         }
+        let has_trackpad_scroll =
+            matches!(bindings.left(), Some(StickMode::TrackpadScroll(_)))
+                || matches!(bindings.right(), Some(StickMode::TrackpadScroll(_)));
+        if has_trackpad_scroll {
+            self.tick_trackpad_scroll(dt_s, &mut sink, axes_list, bindings);
+        }
         if self.generation % 500 == 1 {
             print_debug!(
                 "stick modes: left={:?} right={:?} has_scroll={} axes=[{}]",
@@ -228,7 +240,7 @@ impl StickProcessor {
             });
         if should_report {
             eprintln!(
-                "[stick-metrics] samples={} expected_tick_us={} tick_interval_us({}) tick_execution_us({}) gap_over_1_5x={} gap_over_2x={} gap_over_4x={} missed_periods={} mouse_mode_ticks={} mouse_move_events={} mouse_zero_move_ticks={} mouse_distance_total={:.1} mouse_chunk_max={} mouse_chunk_over_8={} mouse_chunk_over_16={} mouse_chunk_over_32={} scroll_events={}",
+                "[stick-metrics] samples={} expected_tick_us={} tick_interval_us({}) tick_execution_us({}) gap_over_1_5x={} gap_over_2x={} gap_over_4x={} missed_periods={} mouse_mode_ticks={} mouse_move_events={} mouse_zero_move_ticks={} mouse_distance_total={:.1} mouse_chunk_max={} mouse_chunk_over_8={} mouse_chunk_over_16={} mouse_chunk_over_32={} scroll_events={} trackpad_scroll_events={}",
                 self.perf.samples,
                 self.perf.expected_tick_us,
                 self.perf.tick_interval_us.summary(),
@@ -245,7 +257,8 @@ impl StickProcessor {
                 self.perf.mouse_chunk_over_8,
                 self.perf.mouse_chunk_over_16,
                 self.perf.mouse_chunk_over_32,
-                self.perf.scroll_events
+                self.perf.scroll_events,
+                self.perf.trackpad_scroll_events
             );
             self.perf = super::repeat::TickPerfStats {
                 last_report_at: Some(now),
@@ -287,6 +300,9 @@ impl StickProcessor {
             .filter_map(|mode| match mode {
                 Some(StickMode::MouseMove(params)) => Some(params.runtime.tick_ms),
                 Some(StickMode::Scroll(params)) => Some(params.runtime.tick_ms),
+                Some(StickMode::TrackpadScroll(params)) => {
+                    Some(params.runtime.tick_ms)
+                }
                 _ => None,
             })
             .min()
@@ -739,6 +755,37 @@ impl StickProcessor {
         }
     }
 
+    fn tick_trackpad_scroll(
+        &mut self,
+        dt_s: f32,
+        sink: &mut impl FnMut(Effect),
+        axes_list: &[(ControllerId, [f32; 6])],
+        bindings: &CompiledStickRules,
+    ) {
+        for (cid, axes) in axes_list.iter().cloned() {
+            if let Some(StickMode::TrackpadScroll(params)) = bindings.left() {
+                self.tick_trackpad_scroll_side(
+                    cid,
+                    axes,
+                    StickSide::Left,
+                    params,
+                    dt_s,
+                    sink,
+                );
+            }
+            if let Some(StickMode::TrackpadScroll(params)) = bindings.right() {
+                self.tick_trackpad_scroll_side(
+                    cid,
+                    axes,
+                    StickSide::Right,
+                    params,
+                    dt_s,
+                    sink,
+                );
+            }
+        }
+    }
+
     fn tick_scroll_side(
         &mut self,
         cid: ControllerId,
@@ -746,6 +793,48 @@ impl StickProcessor {
         side: StickSide,
         params: &padjutsu_workspace::ScrollParams,
         dt_s: f32,
+        sink: &mut impl FnMut(Effect),
+    ) {
+        self.tick_scroll_side_with_output(
+            cid,
+            axes,
+            side,
+            params,
+            dt_s,
+            ScrollOutput::Wheel,
+            sink,
+        );
+    }
+
+    fn tick_trackpad_scroll_side(
+        &mut self,
+        cid: ControllerId,
+        axes: [f32; 6],
+        side: StickSide,
+        params: &padjutsu_workspace::ScrollParams,
+        dt_s: f32,
+        sink: &mut impl FnMut(Effect),
+    ) {
+        self.tick_scroll_side_with_output(
+            cid,
+            axes,
+            side,
+            params,
+            dt_s,
+            ScrollOutput::Trackpad,
+            sink,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tick_scroll_side_with_output(
+        &mut self,
+        cid: ControllerId,
+        axes: [f32; 6],
+        side: StickSide,
+        params: &padjutsu_workspace::ScrollParams,
+        dt_s: f32,
+        output: ScrollOutput,
         sink: &mut impl FnMut(Effect),
     ) {
         let started_at = std::time::Instant::now();
@@ -823,25 +912,38 @@ impl StickProcessor {
 
         let h = f64::from(accum.0);
         let v = f64::from(accum.1);
-        if h.abs() >= 0.01 {
-            print_debug!(
-                "stick scroll: controller={cid} side={side_label} raw=({x0:.3},{y0:.3}) filtered=({x:.3},{y:.3}) mag={mag:.3} accum=({:.3},{:.3}) emit_h={h}",
-                accum.0,
-                accum.1
-            );
-            (sink)(Effect::Scroll { h, v: 0.0 });
-            self.perf.scroll_events += 1;
-            accum.0 = 0.0;
-        }
-        if v.abs() >= 0.01 {
-            print_debug!(
-                "stick scroll: controller={cid} side={side_label} raw=({x0:.3},{y0:.3}) filtered=({x:.3},{y:.3}) mag={mag:.3} accum=({:.3},{:.3}) emit_v={v}",
-                accum.0,
-                accum.1
-            );
-            (sink)(Effect::Scroll { h: 0.0, v });
-            self.perf.scroll_events += 1;
-            accum.1 = 0.0;
+        match output {
+            ScrollOutput::Trackpad if h.abs() >= 0.01 || v.abs() >= 0.01 => {
+                print_debug!(
+                    "stick trackpad scroll: controller={cid} side={side_label} raw=({x0:.3},{y0:.3}) filtered=({x:.3},{y:.3}) mag={mag:.3} emit=({h:.3},{v:.3})"
+                );
+                (sink)(Effect::TrackpadScroll { h, v });
+                self.perf.trackpad_scroll_events += 1;
+                *accum = (0.0, 0.0);
+            }
+            ScrollOutput::Wheel => {
+                if h.abs() >= 0.01 {
+                    print_debug!(
+                        "stick scroll: controller={cid} side={side_label} raw=({x0:.3},{y0:.3}) filtered=({x:.3},{y:.3}) mag={mag:.3} accum=({:.3},{:.3}) emit_h={h}",
+                        accum.0,
+                        accum.1
+                    );
+                    (sink)(Effect::Scroll { h, v: 0.0 });
+                    self.perf.scroll_events += 1;
+                    accum.0 = 0.0;
+                }
+                if v.abs() >= 0.01 {
+                    print_debug!(
+                        "stick scroll: controller={cid} side={side_label} raw=({x0:.3},{y0:.3}) filtered=({x:.3},{y:.3}) mag={mag:.3} accum=({:.3},{:.3}) emit_v={v}",
+                        accum.0,
+                        accum.1
+                    );
+                    (sink)(Effect::Scroll { h: 0.0, v });
+                    self.perf.scroll_events += 1;
+                    accum.1 = 0.0;
+                }
+            }
+            ScrollOutput::Trackpad => {}
         }
         print_debug!(
             "scroll pipeline done: controller={cid} side={side_label} elapsed_us={} remaining_accum=({:.3},{:.3})",
@@ -1115,6 +1217,41 @@ mod tests {
                 "horizontal scroll should be zero when horizontal=false"
             );
         }
+    }
+
+    #[test]
+    fn trackpad_scroll_emits_one_two_axis_effect_for_diagonal_input() {
+        let mut proc = StickProcessor::new();
+        let params = scroll_params(true, false);
+        let mut effects = Vec::new();
+
+        for _ in 0..20 {
+            proc.tick_trackpad_scroll_side(
+                1,
+                right_stick_axes(0.6, 0.7),
+                StickSide::Right,
+                &params,
+                0.010,
+                &mut |effect| effects.push(effect),
+            );
+        }
+
+        let trackpad_events: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::TrackpadScroll { h, v } => Some((*h, *v)),
+                _ => None,
+            })
+            .collect();
+        assert!(!trackpad_events.is_empty());
+        assert!(trackpad_events.iter().all(|(h, v)| *h != 0.0 && *v != 0.0));
+        assert!(effects
+            .iter()
+            .all(|effect| matches!(effect, Effect::TrackpadScroll { .. })));
+        assert_eq!(
+            proc.perf.trackpad_scroll_events,
+            trackpad_events.len() as u64
+        );
     }
 
     #[test]

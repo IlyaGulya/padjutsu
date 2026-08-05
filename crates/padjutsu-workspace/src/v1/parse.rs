@@ -347,6 +347,24 @@ fn parse_stick_mode(raw: ProfileV1Stick) -> Result<StickMode, Error> {
             };
             StickMode::Scroll(params)
         }
+        "trackpad_scroll" => {
+            let params = ScrollParams {
+                deadzone,
+                speed_lines_s: raw.speed_lines_s.unwrap_or(100.0),
+                horizontal: true,
+                axis_lock: raw.axis_lock.unwrap_or(false),
+                invert_x: raw.invert_x.unwrap_or(false),
+                invert_y: raw.invert_y.unwrap_or(false),
+                runtime: ScrollRuntimeParams {
+                    tick_ms: raw.tick_ms.unwrap_or(4),
+                    smoothing_window_ms: raw.smoothing_window_ms.unwrap_or(25),
+                    gamma: raw.gamma.unwrap_or(1.5),
+                    trigger_boost_max: raw.trigger_boost_max.unwrap_or(5.0),
+                    trigger_boost_gamma: raw.trigger_boost_gamma.unwrap_or(1.5),
+                },
+            };
+            StickMode::TrackpadScroll(params)
+        }
         "volume" => {
             let axis =
                 match raw.axis.as_deref().unwrap_or("y").to_lowercase().as_str() {

@@ -65,7 +65,7 @@ pub(crate) struct ProfileV1ControllerSettings {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileV1Stick {
-    pub mode: String, // arrows | volume | brightness | scroll | mouse_move
+    pub mode: String, // arrows | volume | brightness | scroll | trackpad_scroll | mouse_move
     #[serde(default)]
     pub deadzone: Option<f32>,
     // arrows

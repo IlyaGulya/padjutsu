@@ -24,6 +24,7 @@ pub enum StickModeKind {
     Brightness,
     MouseMove,
     Scroll,
+    TrackpadScroll,
 }
 
 impl StickModeKind {
@@ -34,6 +35,7 @@ impl StickModeKind {
             StickMode::Brightness(_) => Self::Brightness,
             StickMode::MouseMove(_) => Self::MouseMove,
             StickMode::Scroll(_) => Self::Scroll,
+            StickMode::TrackpadScroll(_) => Self::TrackpadScroll,
         }
     }
 }

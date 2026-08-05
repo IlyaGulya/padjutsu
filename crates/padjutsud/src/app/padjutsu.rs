@@ -449,6 +449,9 @@ impl Padjutsu {
             let candidate_tick_ms = match side {
                 Some(StickMode::MouseMove(params)) => Some(params.runtime.tick_ms),
                 Some(StickMode::Scroll(params)) => Some(params.runtime.tick_ms),
+                Some(StickMode::TrackpadScroll(params)) => {
+                    Some(params.runtime.tick_ms)
+                }
                 _ => None,
             };
             let Some(candidate_tick_ms) = candidate_tick_ms else {
@@ -476,6 +479,7 @@ impl Padjutsu {
                     | StickMode::Brightness(_)
                     | StickMode::MouseMove(_)
                     | StickMode::Scroll(_)
+                    | StickMode::TrackpadScroll(_)
             )
         ) || matches!(
             bindings.right(),
@@ -485,6 +489,7 @@ impl Padjutsu {
                     | StickMode::Brightness(_)
                     | StickMode::MouseMove(_)
                     | StickMode::Scroll(_)
+                    | StickMode::TrackpadScroll(_)
             )
         )
     }
@@ -496,10 +501,14 @@ impl Padjutsu {
 
         matches!(
             bindings.get(&padjutsu_workspace::StickSide::Left),
-            Some(StickMode::MouseMove(_)) | Some(StickMode::Scroll(_))
+            Some(StickMode::MouseMove(_))
+                | Some(StickMode::Scroll(_))
+                | Some(StickMode::TrackpadScroll(_))
         ) || matches!(
             bindings.get(&padjutsu_workspace::StickSide::Right),
-            Some(StickMode::MouseMove(_)) | Some(StickMode::Scroll(_))
+            Some(StickMode::MouseMove(_))
+                | Some(StickMode::Scroll(_))
+                | Some(StickMode::TrackpadScroll(_))
         )
     }
 
