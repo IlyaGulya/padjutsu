@@ -27,8 +27,16 @@ fn trigger_scroll_boost(
     axes: [f32; 6],
     params: &padjutsu_workspace::ScrollParams,
 ) -> (f32, f32) {
-    let lt = axes[axis_index(padjutsu_gamepad::Axis::LeftTrigger)].max(0.0);
-    let rt = axes[axis_index(padjutsu_gamepad::Axis::RightTrigger)].max(0.0);
+    let lt = if params.zoom_button == Some(padjutsu_gamepad::Button::LeftTrigger) {
+        0.0
+    } else {
+        axes[axis_index(padjutsu_gamepad::Axis::LeftTrigger)].max(0.0)
+    };
+    let rt = if params.zoom_button == Some(padjutsu_gamepad::Button::RightTrigger) {
+        0.0
+    } else {
+        axes[axis_index(padjutsu_gamepad::Axis::RightTrigger)].max(0.0)
+    };
     let trigger = lt.max(rt).clamp(0.0, 1.0);
     let boost = 1.0
         + params.runtime.trigger_boost_max
@@ -1033,6 +1041,17 @@ mod tests {
                 trigger_boost_gamma: 1.5,
             },
         }
+    }
+
+    #[test]
+    fn zoom_trigger_is_not_also_used_for_scroll_boost() {
+        let mut params = scroll_params(true, false);
+        params.zoom_button = Some(padjutsu_gamepad::Button::RightTrigger);
+        let axes = [0.0, 0.0, 0.0, 0.0, 0.5, 1.0];
+
+        let (trigger, _) = trigger_scroll_boost(axes, &params);
+
+        assert_eq!(trigger, 0.5, "only LT should accelerate RT zoom");
     }
 
     /// Create axes array with right stick values (indices 2=RightX, 3=RightY).
