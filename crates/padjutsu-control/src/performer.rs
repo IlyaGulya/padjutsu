@@ -1,6 +1,6 @@
-use enigo::{Axis, Button, Direction, Enigo, InputResult, Mouse, NewConError, Settings};
+use enigo::{Axis, Button, Enigo, InputResult, NewConError, Settings};
 #[cfg(not(target_os = "macos"))]
-use enigo::Coordinate;
+use enigo::{Coordinate, Direction, Mouse};
 
 use crate::KeyCombo;
 
@@ -167,10 +167,9 @@ mod relative_mouse {
         .map_err(|_| InputError::Simulate("failed to create mouse source"))?
         .map_err(|_| InputError::Simulate("failed creating relative mouse event"))?;
 
-        event
-            .set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
-        event
-            .set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
+        let (delta_x, delta_y) = movement_delta_fields(dx, dy);
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, delta_x);
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, delta_y);
         event.set_integer_value_field(
             EventField::EVENT_SOURCE_USER_DATA,
             enigo::EVENT_MARKER as i64,
@@ -186,6 +185,13 @@ mod relative_mouse {
 
     fn offset_point(point: CGPoint, dx: i32, dy: i32) -> CGPoint {
         CGPoint::new(point.x + f64::from(dx), point.y + f64::from(dy))
+    }
+
+    pub(super) fn movement_delta_fields(_dx: i32, _dy: i32) -> (i64, i64) {
+        // The absolute Quartz destination is the source of truth. Publishing
+        // the requested relative delta as well lets WindowServer accumulate
+        // invisible motion after the cursor has hit a display edge.
+        (0, 0)
     }
 
     #[cfg(test)]
@@ -206,6 +212,125 @@ mod relative_mouse {
             assert_eq!(destination.x, 769.0);
             assert_eq!(destination.y, 961.984_375);
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod native_mouse {
+    use core_graphics::{
+        display::CGPoint,
+        event::{
+            CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
+        },
+    };
+    use enigo::{Button, InputError, InputResult};
+
+    struct ButtonEventSpec {
+        button: CGMouseButton,
+        event_type: CGEventType,
+        button_number: Option<i64>,
+    }
+
+    pub(super) fn event_location(point: CGPoint) -> CGPoint {
+        // Quartz already reports global coordinates with the current display
+        // layout. Do not convert them through cached AppKit display geometry.
+        point
+    }
+
+    fn event_spec(button: Button, pressed: bool) -> InputResult<ButtonEventSpec> {
+        let (button, down, up, button_number) = match button {
+            Button::Left => (
+                CGMouseButton::Left,
+                CGEventType::LeftMouseDown,
+                CGEventType::LeftMouseUp,
+                None,
+            ),
+            Button::Right => (
+                CGMouseButton::Right,
+                CGEventType::RightMouseDown,
+                CGEventType::RightMouseUp,
+                None,
+            ),
+            Button::Middle => (
+                CGMouseButton::Center,
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+                Some(2),
+            ),
+            Button::Back => (
+                CGMouseButton::Center,
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+                Some(3),
+            ),
+            Button::Forward => (
+                CGMouseButton::Center,
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+                Some(4),
+            ),
+            Button::ScrollUp
+            | Button::ScrollDown
+            | Button::ScrollLeft
+            | Button::ScrollRight => {
+                return Err(InputError::InvalidInput(
+                    "scroll button is not a pointer button",
+                ));
+            }
+        };
+        Ok(ButtonEventSpec {
+            button,
+            event_type: if pressed { down } else { up },
+            button_number,
+        })
+    }
+
+    fn post(button: Button, pressed: bool, click_count: i64) -> InputResult<()> {
+        let spec = event_spec(button, pressed)?;
+        let event = super::cg_source::with(|source| -> Result<_, ()> {
+            let point = event_location(CGEvent::new(source.clone())?.location());
+            CGEvent::new_mouse_event(
+                source.clone(),
+                spec.event_type,
+                point,
+                spec.button,
+            )
+        })
+        .map_err(|_| InputError::Simulate("failed to create mouse source"))?
+        .map_err(|_| InputError::Simulate("failed creating mouse button event"))?;
+
+        if let Some(button_number) = spec.button_number {
+            event.set_integer_value_field(
+                EventField::MOUSE_EVENT_BUTTON_NUMBER,
+                button_number,
+            );
+        }
+        event.set_integer_value_field(
+            EventField::MOUSE_EVENT_CLICK_STATE,
+            click_count,
+        );
+        event.set_integer_value_field(
+            EventField::EVENT_SOURCE_USER_DATA,
+            enigo::EVENT_MARKER as i64,
+        );
+        event.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    pub fn click(button: Button, count: i64) -> InputResult<()> {
+        for click_count in 1..=count {
+            post(button, true, click_count)?;
+            post(button, false, click_count)?;
+        }
+        Ok(())
+    }
+
+    pub fn press(button: Button) -> InputResult<()> {
+        post(button, true, 1)
+    }
+
+    pub fn release(button: Button) -> InputResult<()> {
+        post(button, false, 1)
     }
 }
 
@@ -468,6 +593,26 @@ pub struct Performer {
 unsafe impl Send for Performer {}
 unsafe impl Sync for Performer {}
 
+#[cfg(all(test, target_os = "macos"))]
+mod display_reconfiguration_regression_tests {
+    use core_graphics::display::CGPoint;
+
+    use super::{native_mouse, relative_mouse};
+
+    #[test]
+    fn click_uses_live_quartz_point_without_display_height_conversion() {
+        let live_point = CGPoint::new(933.5, 868.7);
+        let event_point = native_mouse::event_location(live_point);
+        assert_eq!(event_point.x, live_point.x);
+        assert_eq!(event_point.y, live_point.y);
+    }
+
+    #[test]
+    fn movement_does_not_publish_hidden_relative_distance_at_screen_edges() {
+        assert_eq!(relative_mouse::movement_delta_fields(20, -15), (0, 0));
+    }
+}
+
 impl Performer {
     /// Create a new performer.
     pub fn new() -> Result<Self, NewConError> {
@@ -576,11 +721,23 @@ impl Performer {
     }
 
     /// Click a mouse button.
+    #[cfg(target_os = "macos")]
+    pub fn mouse_click(&mut self, button: Button) -> InputResult<()> {
+        with_pool(|| native_mouse::click(button, 1))
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn mouse_click(&mut self, button: Button) -> InputResult<()> {
         with_pool(|| self.enigo.button(button, Direction::Click))
     }
 
     /// Double-click a mouse button.
+    #[cfg(target_os = "macos")]
+    pub fn mouse_double_click(&mut self, button: Button) -> InputResult<()> {
+        with_pool(|| native_mouse::click(button, 2))
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn mouse_double_click(&mut self, button: Button) -> InputResult<()> {
         with_pool(|| {
             self.enigo.button(button, Direction::Click)?;
@@ -589,11 +746,23 @@ impl Performer {
     }
 
     /// Press a mouse button (hold down).
+    #[cfg(target_os = "macos")]
+    pub fn mouse_press(&mut self, button: Button) -> InputResult<()> {
+        with_pool(|| native_mouse::press(button))
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn mouse_press(&mut self, button: Button) -> InputResult<()> {
         with_pool(|| self.enigo.button(button, Direction::Press))
     }
 
     /// Release a mouse button.
+    #[cfg(target_os = "macos")]
+    pub fn mouse_release(&mut self, button: Button) -> InputResult<()> {
+        with_pool(|| native_mouse::release(button))
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn mouse_release(&mut self, button: Button) -> InputResult<()> {
         with_pool(|| self.enigo.button(button, Direction::Release))
     }
