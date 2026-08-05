@@ -315,27 +315,27 @@ mod smooth_scroll {
         fixed_axis_2: i64,
         point_axis_1: i64,
         point_axis_2: i64,
-        continuous: i64,
+        continuous: Option<i64>,
     }
 
     fn event_fields(
         horizontal: f64,
         vertical: f64,
-        continuous: bool,
+        continuous: Option<bool>,
     ) -> ScrollEventFields {
         ScrollEventFields {
             fixed_axis_1: (vertical * 65536.0).round() as i64,
             fixed_axis_2: (horizontal * 65536.0).round() as i64,
             point_axis_1: vertical.round() as i64,
             point_axis_2: horizontal.round() as i64,
-            continuous: i64::from(continuous),
+            continuous: continuous.map(i64::from),
         }
     }
 
     pub fn post(axis: Axis, value: f64) -> InputResult<()> {
         match axis {
-            Axis::Horizontal => post_values(value, 0.0, false, false),
-            Axis::Vertical => post_values(0.0, value, false, false),
+            Axis::Horizontal => post_values(value, 0.0, None, false),
+            Axis::Vertical => post_values(0.0, value, None, false),
         }
     }
 
@@ -344,7 +344,7 @@ mod smooth_scroll {
         vertical: f64,
         zoom: bool,
     ) -> InputResult<()> {
-        post_values(horizontal, vertical, true, zoom)
+        post_values(horizontal, vertical, Some(true), zoom)
     }
 
     fn trackpad_event_flags(zoom: bool) -> CGEventFlags {
@@ -358,7 +358,7 @@ mod smooth_scroll {
     fn post_values(
         horizontal: f64,
         vertical: f64,
-        continuous: bool,
+        continuous: Option<bool>,
         zoom: bool,
     ) -> InputResult<()> {
         // Use cached thread-local CGEventSource (see `cg_source` module above)
@@ -379,7 +379,7 @@ mod smooth_scroll {
         let fields = event_fields(horizontal, vertical, continuous);
 
         debug!(
-            "[smooth_scroll] horizontal={horizontal:.3} vertical={vertical:.3} continuous={continuous} fixed1={} fixed2={} point1={} point2={}",
+            "[smooth_scroll] horizontal={horizontal:.3} vertical={vertical:.3} continuous_override={continuous:?} fixed1={} fixed2={} point1={} point2={}",
             fields.fixed_axis_1,
             fields.fixed_axis_2,
             fields.point_axis_1,
@@ -406,10 +406,12 @@ mod smooth_scroll {
             EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
             fields.point_axis_2,
         );
-        event.set_integer_value_field(
-            EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
-            fields.continuous,
-        );
+        if let Some(continuous) = fields.continuous {
+            event.set_integer_value_field(
+                EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
+                continuous,
+            );
+        }
         event.set_integer_value_field(
             EventField::EVENT_SOURCE_USER_DATA,
             enigo::EVENT_MARKER as i64,
@@ -417,7 +419,7 @@ mod smooth_scroll {
         event.set_flags(trackpad_event_flags(zoom));
         event.post(CGEventTapLocation::HID);
         debug!(
-            "[smooth_scroll] posted horizontal={horizontal:.3} vertical={vertical:.3} continuous={continuous} zoom={zoom}"
+            "[smooth_scroll] posted horizontal={horizontal:.3} vertical={vertical:.3} continuous_override={continuous:?} zoom={zoom}"
         );
         Ok(())
     }
@@ -429,15 +431,20 @@ mod smooth_scroll {
         #[test]
         fn trackpad_fields_preserve_both_axes_and_mark_event_continuous() {
             assert_eq!(
-                event_fields(1.25, -2.5, true),
+                event_fields(1.25, -2.5, Some(true)),
                 ScrollEventFields {
                     fixed_axis_1: -163_840,
                     fixed_axis_2: 81_920,
                     point_axis_1: -3,
                     point_axis_2: 1,
-                    continuous: 1,
+                    continuous: Some(1),
                 }
             );
+        }
+
+        #[test]
+        fn wheel_scroll_keeps_quartz_pixel_continuous_default() {
+            assert_eq!(event_fields(1.0, -2.0, None).continuous, None);
         }
 
         #[test]
