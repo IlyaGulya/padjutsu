@@ -8,6 +8,7 @@ use crate::KeyCombo;
 pub(crate) struct MouseMoveObservation {
     pub(crate) x: i32,
     pub(crate) y: i32,
+    pub(crate) display_epoch: u64,
 }
 
 /// Wrap a CG/Cocoa-using closure in a macOS autorelease pool so any
@@ -63,6 +64,58 @@ mod cg_source {
 }
 
 #[cfg(target_os = "macos")]
+mod display_configuration {
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use core_graphics::display::{
+        CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback,
+        CGDisplayRemoveReconfigurationCallback,
+    };
+
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "C" fn reconfigured(
+        _display: u32,
+        flags: u32,
+        _user_info: *const c_void,
+    ) {
+        // CoreGraphics invokes the callback both before and after a change.
+        // Publish only completed configurations.
+        if flags
+            & CGDisplayChangeSummaryFlags::kCGDisplayBeginConfigurationFlag.bits()
+            == 0
+        {
+            EPOCH.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub fn epoch() -> u64 {
+        EPOCH.load(Ordering::Acquire)
+    }
+
+    pub struct Observer;
+
+    impl Observer {
+        pub fn register() -> Option<Self> {
+            let result = unsafe {
+                CGDisplayRegisterReconfigurationCallback(reconfigured, ptr::null())
+            };
+            (result == 0).then_some(Self)
+        }
+    }
+
+    impl Drop for Observer {
+        fn drop(&mut self) {
+            unsafe {
+                CGDisplayRemoveReconfigurationCallback(reconfigured, ptr::null());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 mod relative_mouse {
     use core_graphics::{
         display::CGPoint,
@@ -86,19 +139,11 @@ mod relative_mouse {
 
     /// Post a relative move while preserving Enigo's macOS semantics.
     ///
-    /// The live cursor position and pressed buttons are intentionally queried
-    /// for every event. Only the display height is cached by `Performer`;
-    /// querying it through `CGDisplayPixelsHigh` on every tick can block on
-    /// WindowServer for milliseconds under graphics load.
-    pub fn post(
-        dx: i32,
-        dy: i32,
-        display_height: i32,
-    ) -> InputResult<MouseMoveObservation> {
+    /// Cursor position is read in native Quartz coordinates. This avoids any
+    /// dependence on cached display height or AppKit's screen-layout cache,
+    /// which can become stale after monitor reconfiguration.
+    pub fn post(dx: i32, dy: i32) -> InputResult<MouseMoveObservation> {
         let pressed = unsafe { NSEvent::pressedMouseButtons() };
-        let point = unsafe { NSEvent::mouseLocation() };
-        let current_x = point.x as i32;
-        let current_y = display_height - point.y as i32;
 
         let (event_type, button) = if pressed & 1 > 0 {
             (CGEventType::LeftMouseDragged, CGMouseButton::Left)
@@ -108,12 +153,16 @@ mod relative_mouse {
             (CGEventType::MouseMoved, CGMouseButton::Left)
         };
 
-        let destination = CGPoint::new(
-            f64::from(current_x.saturating_add(dx)),
-            f64::from(current_y.saturating_add(dy)),
-        );
-        let event = super::cg_source::with(|source| {
-            CGEvent::new_mouse_event(source.clone(), event_type, destination, button)
+        let (point, event) = super::cg_source::with(|source| -> Result<_, ()> {
+            let point = CGEvent::new(source.clone())?.location();
+            let destination = offset_point(point, dx, dy);
+            let event = CGEvent::new_mouse_event(
+                source.clone(),
+                event_type,
+                destination,
+                button,
+            )?;
+            Ok((point, event))
         })
         .map_err(|_| InputError::Simulate("failed to create mouse source"))?
         .map_err(|_| InputError::Simulate("failed creating relative mouse event"))?;
@@ -129,9 +178,14 @@ mod relative_mouse {
         event.set_flags(movement_event_flags());
         event.post(CGEventTapLocation::HID);
         Ok(MouseMoveObservation {
-            x: current_x,
-            y: current_y,
+            x: point.x.round() as i32,
+            y: point.y.round() as i32,
+            display_epoch: super::display_configuration::epoch(),
         })
+    }
+
+    fn offset_point(point: CGPoint, dx: i32, dy: i32) -> CGPoint {
+        CGPoint::new(point.x + f64::from(dx), point.y + f64::from(dy))
     }
 
     #[cfg(test)]
@@ -143,6 +197,14 @@ mod relative_mouse {
             let flags = movement_event_flags();
             assert!(!flags.contains(CGEventFlags::CGEventFlagNonCoalesced));
             assert_eq!(flags.bits() & 0x2000_0000, 0);
+        }
+
+        #[test]
+        fn quartz_coordinates_do_not_depend_on_display_height() {
+            let destination =
+                offset_point(CGPoint::new(757.0, 981.984_375), 12, -20);
+            assert_eq!(destination.x, 769.0);
+            assert_eq!(destination.y, 961.984_375);
         }
     }
 }
@@ -320,7 +382,7 @@ mod smooth_scroll {
 pub struct Performer {
     enigo: Enigo,
     #[cfg(target_os = "macos")]
-    display_height: i32,
+    _display_observer: Option<display_configuration::Observer>,
 }
 
 // SAFETY: This is safe because we're only accessing Enigo through a Mutex,
@@ -334,13 +396,10 @@ impl Performer {
     pub fn new() -> Result<Self, NewConError> {
         let settings = Settings::default();
         let enigo = Enigo::new(&settings)?;
-        #[cfg(target_os = "macos")]
-        let display_height =
-            core_graphics::display::CGDisplay::main().pixels_high() as i32;
         Ok(Self {
             enigo,
             #[cfg(target_os = "macos")]
-            display_height,
+            _display_observer: display_configuration::Observer::register(),
         })
     }
 
@@ -372,7 +431,7 @@ impl Performer {
         x: i32,
         y: i32,
     ) -> InputResult<Option<MouseMoveObservation>> {
-        with_pool(|| relative_mouse::post(x, y, self.display_height)).map(Some)
+        with_pool(|| relative_mouse::post(x, y)).map(Some)
     }
 
     /// Fallback for non-macOS systems.

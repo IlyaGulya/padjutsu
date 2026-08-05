@@ -473,6 +473,7 @@ struct WorkerMetrics {
     mouse_delta_change_axis: ValueStats,
     cursor_tracking_error_axis: ValueStats,
     cursor_stalled: u64,
+    display_reconfiguration_events: u64,
     mouse_posts: u64,
     mouse_commands: u64,
     cancelled_mouse_commands: u64,
@@ -481,6 +482,7 @@ struct WorkerMetrics {
     last_mouse_post_at: Option<Instant>,
     last_mouse_delta: Option<(i32, i32)>,
     last_cursor: Option<(i32, i32)>,
+    last_display_epoch: Option<u64>,
     scroll_post: TimingStats,
     other_execution: TimingStats,
 }
@@ -510,6 +512,7 @@ impl WorkerMetrics {
             mouse_delta_change_axis: ValueStats::default(),
             cursor_tracking_error_axis: ValueStats::default(),
             cursor_stalled: 0,
+            display_reconfiguration_events: 0,
             mouse_posts: 0,
             mouse_commands: 0,
             cancelled_mouse_commands: 0,
@@ -518,6 +521,7 @@ impl WorkerMetrics {
             last_mouse_post_at: None,
             last_mouse_delta: None,
             last_cursor: None,
+            last_display_epoch: None,
             scroll_post: TimingStats::default(),
             other_execution: TimingStats::default(),
         }
@@ -603,6 +607,19 @@ impl WorkerMetrics {
         }
 
         if let Some(observation) = observation {
+            if let Some(previous_epoch) = self.last_display_epoch {
+                if observation.display_epoch != previous_epoch {
+                    self.display_reconfiguration_events += observation
+                        .display_epoch
+                        .saturating_sub(previous_epoch)
+                        .max(1);
+                    // A display change may legitimately move the cursor. Do
+                    // not report that system transition as a tracking error.
+                    self.last_cursor = None;
+                    self.last_mouse_delta = None;
+                }
+            }
+            self.last_display_epoch = Some(observation.display_epoch);
             if let (Some((cursor_x, cursor_y)), Some((expected_dx, expected_dy))) =
                 (self.last_cursor, self.last_mouse_delta)
             {
@@ -648,7 +665,7 @@ impl WorkerMetrics {
         }
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         eprintln!(
-            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
+            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} display_epoch={} display_reconfiguration_events={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
             self.started_at.elapsed().as_millis(),
             self.batches,
             self.commands,
@@ -670,6 +687,8 @@ impl WorkerMetrics {
             self.mouse_delta_change_axis.summary(),
             self.cursor_tracking_error_axis.summary(),
             self.cursor_stalled,
+            self.last_display_epoch.unwrap_or(0),
+            self.display_reconfiguration_events,
             self.mouse_posts,
             self.mouse_commands,
             self.cancelled_mouse_commands,
@@ -682,10 +701,12 @@ impl WorkerMetrics {
         let last_mouse_post_at = self.last_mouse_post_at;
         let last_mouse_delta = self.last_mouse_delta;
         let last_cursor = self.last_cursor;
+        let last_display_epoch = self.last_display_epoch;
         *self = Self::new(true, dropped);
         self.last_mouse_post_at = last_mouse_post_at;
         self.last_mouse_delta = last_mouse_delta;
         self.last_cursor = last_cursor;
+        self.last_display_epoch = last_display_epoch;
     }
 }
 
@@ -872,7 +893,11 @@ mod tests {
             1,
             now,
             Some(now),
-            Some(MouseMoveObservation { x: 100, y: 100 }),
+            Some(MouseMoveObservation {
+                x: 100,
+                y: 100,
+                display_epoch: 0,
+            }),
         );
         metrics.record_mouse(
             5,
@@ -880,7 +905,11 @@ mod tests {
             2,
             now + Duration::from_millis(7),
             Some(now + Duration::from_millis(8)),
-            Some(MouseMoveObservation { x: 100, y: 100 }),
+            Some(MouseMoveObservation {
+                x: 100,
+                y: 100,
+                display_epoch: 0,
+            }),
         );
 
         assert_eq!(metrics.cursor_stalled, 1);
@@ -899,5 +928,39 @@ mod tests {
         assert_eq!(metrics.mouse_post_over_4ms, 1);
         assert_eq!(metrics.mouse_post_over_16ms, 1);
         assert_eq!(metrics.mouse_post_over_50ms, 1);
+    }
+
+    #[test]
+    fn display_reconfiguration_resets_cursor_tracking_baseline() {
+        let now = Instant::now();
+        let mut metrics = WorkerMetrics::new(true, Arc::new(AtomicU64::new(0)));
+        metrics.record_mouse(
+            5,
+            0,
+            1,
+            now,
+            Some(now),
+            Some(MouseMoveObservation {
+                x: 100,
+                y: 100,
+                display_epoch: 0,
+            }),
+        );
+        metrics.record_mouse(
+            5,
+            0,
+            1,
+            now,
+            Some(now),
+            Some(MouseMoveObservation {
+                x: 500,
+                y: 500,
+                display_epoch: 1,
+            }),
+        );
+
+        assert_eq!(metrics.display_reconfiguration_events, 1);
+        assert_eq!(metrics.cursor_tracking_error_axis.samples, 0);
+        assert_eq!(metrics.cursor_stalled, 0);
     }
 }
