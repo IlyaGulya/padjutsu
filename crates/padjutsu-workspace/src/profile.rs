@@ -220,6 +220,8 @@ pub struct ScrollParams {
     pub axis_lock: bool,
     pub invert_x: bool,
     pub invert_y: bool,
+    /// Optional button that turns trackpad scrolling into Cmd+scroll zoom.
+    pub zoom_button: Option<padjutsu_gamepad::Button>,
     pub runtime: ScrollRuntimeParams,
 }
 

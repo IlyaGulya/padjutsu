@@ -35,6 +35,7 @@ pub enum PerformerCmd {
     TrackpadScroll {
         horizontal: f64,
         vertical: f64,
+        zoom: bool,
     },
     MouseClick(Button),
     MouseDoubleClick(Button),
@@ -283,10 +284,16 @@ fn execute_batch(
                 }
                 metrics.record_coalesced(i - segment_start - 1);
             }
-            PerformerCmd::TrackpadScroll { .. } => {
+            PerformerCmd::TrackpadScroll { zoom, .. } => {
                 let segment_start = i;
                 while i < batch.len()
-                    && matches!(batch[i].cmd, PerformerCmd::TrackpadScroll { .. })
+                    && matches!(
+                        batch[i].cmd,
+                        PerformerCmd::TrackpadScroll {
+                            zoom: next_zoom,
+                            ..
+                        } if next_zoom == *zoom
+                    )
                 {
                     i += 1;
                 }
@@ -295,6 +302,7 @@ fn execute_batch(
                         if let PerformerCmd::TrackpadScroll {
                             horizontal,
                             vertical,
+                            ..
                         } = queued.cmd
                         {
                             Some((horizontal, vertical))
@@ -305,7 +313,7 @@ fn execute_batch(
                 );
                 if horizontal != 0.0 || vertical != 0.0 {
                     let started_at = metrics.start_execution();
-                    let _ = performer.trackpad_scroll(horizontal, vertical);
+                    let _ = performer.trackpad_scroll(horizontal, vertical, *zoom);
                     metrics.record_execution(ExecutionKind::Scroll, started_at);
                 }
                 metrics.record_coalesced(i - segment_start - 1);
@@ -344,8 +352,9 @@ fn execute_one(performer: &mut Performer, cmd: &PerformerCmd) {
         PerformerCmd::TrackpadScroll {
             horizontal,
             vertical,
+            zoom,
         } => {
-            let _ = performer.trackpad_scroll(*horizontal, *vertical);
+            let _ = performer.trackpad_scroll(*horizontal, *vertical, *zoom);
         }
         PerformerCmd::MouseClick(b) => {
             let _ = performer.mouse_click(*b);

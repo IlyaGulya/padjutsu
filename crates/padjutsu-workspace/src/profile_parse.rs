@@ -118,4 +118,29 @@ rules:
             other => panic!("expected TrackpadScroll, got {other:?}"),
         }
     }
+
+    #[test]
+    fn parse_trackpad_scroll_zoom_button() {
+        let yaml = r#"
+version: 1
+rules:
+  common:
+    sticks:
+      right:
+        mode: trackpad_scroll
+        zoom_button: lb
+"#;
+        let profile = parse_profile(yaml).expect("should parse");
+        let right = profile.rules["common"]
+            .sticks
+            .get(&crate::StickSide::Right)
+            .expect("right stick");
+        match right {
+            StickMode::TrackpadScroll(params) => assert_eq!(
+                params.zoom_button,
+                Some(padjutsu_gamepad::Button::LeftShoulder)
+            ),
+            other => panic!("expected TrackpadScroll, got {other:?}"),
+        }
+    }
 }

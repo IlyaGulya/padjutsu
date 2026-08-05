@@ -106,6 +106,7 @@ impl StickProcessor {
         bindings: Option<&CompiledStickRules>,
         axes_list: &[(ControllerId, [f32; 6])],
         precision: bool,
+        trackpad_zoom: bool,
         mut sink: F,
     ) {
         if axes_list.is_empty() && !self.has_active_repeats() {
@@ -179,7 +180,13 @@ impl StickProcessor {
             matches!(bindings.left(), Some(StickMode::TrackpadScroll(_)))
                 || matches!(bindings.right(), Some(StickMode::TrackpadScroll(_)));
         if has_trackpad_scroll {
-            self.tick_trackpad_scroll(dt_s, &mut sink, axes_list, bindings);
+            self.tick_trackpad_scroll(
+                dt_s,
+                &mut sink,
+                axes_list,
+                bindings,
+                trackpad_zoom,
+            );
         }
         if self.generation % 500 == 1 {
             print_debug!(
@@ -761,6 +768,7 @@ impl StickProcessor {
         sink: &mut impl FnMut(Effect),
         axes_list: &[(ControllerId, [f32; 6])],
         bindings: &CompiledStickRules,
+        zoom: bool,
     ) {
         for (cid, axes) in axes_list.iter().cloned() {
             if let Some(StickMode::TrackpadScroll(params)) = bindings.left() {
@@ -770,6 +778,7 @@ impl StickProcessor {
                     StickSide::Left,
                     params,
                     dt_s,
+                    zoom,
                     sink,
                 );
             }
@@ -780,6 +789,7 @@ impl StickProcessor {
                     StickSide::Right,
                     params,
                     dt_s,
+                    zoom,
                     sink,
                 );
             }
@@ -802,6 +812,7 @@ impl StickProcessor {
             params,
             dt_s,
             ScrollOutput::Wheel,
+            false,
             sink,
         );
     }
@@ -813,6 +824,7 @@ impl StickProcessor {
         side: StickSide,
         params: &padjutsu_workspace::ScrollParams,
         dt_s: f32,
+        zoom: bool,
         sink: &mut impl FnMut(Effect),
     ) {
         self.tick_scroll_side_with_output(
@@ -822,6 +834,7 @@ impl StickProcessor {
             params,
             dt_s,
             ScrollOutput::Trackpad,
+            zoom,
             sink,
         );
     }
@@ -835,6 +848,7 @@ impl StickProcessor {
         params: &padjutsu_workspace::ScrollParams,
         dt_s: f32,
         output: ScrollOutput,
+        zoom: bool,
         sink: &mut impl FnMut(Effect),
     ) {
         let started_at = std::time::Instant::now();
@@ -910,6 +924,9 @@ impl StickProcessor {
             }
         }
 
+        if zoom {
+            accum.0 = 0.0;
+        }
         let h = f64::from(accum.0);
         let v = f64::from(accum.1);
         match output {
@@ -917,7 +934,7 @@ impl StickProcessor {
                 print_debug!(
                     "stick trackpad scroll: controller={cid} side={side_label} raw=({x0:.3},{y0:.3}) filtered=({x:.3},{y:.3}) mag={mag:.3} emit=({h:.3},{v:.3})"
                 );
-                (sink)(Effect::TrackpadScroll { h, v });
+                (sink)(Effect::TrackpadScroll { h, v, zoom });
                 self.perf.trackpad_scroll_events += 1;
                 *accum = (0.0, 0.0);
             }
@@ -1007,6 +1024,7 @@ mod tests {
             axis_lock,
             invert_x: false,
             invert_y: false,
+            zoom_button: None,
             runtime: ScrollRuntimeParams {
                 tick_ms: 4,
                 smoothing_window_ms: 25,
@@ -1232,6 +1250,7 @@ mod tests {
                 StickSide::Right,
                 &params,
                 0.010,
+                false,
                 &mut |effect| effects.push(effect),
             );
         }
@@ -1239,7 +1258,10 @@ mod tests {
         let trackpad_events: Vec<_> = effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::TrackpadScroll { h, v } => Some((*h, *v)),
+                Effect::TrackpadScroll { h, v, zoom } => {
+                    assert!(!zoom);
+                    Some((*h, *v))
+                }
                 _ => None,
             })
             .collect();
@@ -1252,6 +1274,34 @@ mod tests {
             proc.perf.trackpad_scroll_events,
             trackpad_events.len() as u64
         );
+    }
+
+    #[test]
+    fn trackpad_zoom_suppresses_horizontal_axis_and_marks_event() {
+        let mut proc = StickProcessor::new();
+        let params = scroll_params(true, false);
+        let mut effects = Vec::new();
+
+        for _ in 0..20 {
+            proc.tick_trackpad_scroll_side(
+                1,
+                right_stick_axes(0.6, 0.7),
+                StickSide::Right,
+                &params,
+                0.010,
+                true,
+                &mut |effect| effects.push(effect),
+            );
+        }
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::TrackpadScroll {
+                h: 0.0,
+                v,
+                zoom: true
+            } if *v != 0.0
+        )));
     }
 
     #[test]

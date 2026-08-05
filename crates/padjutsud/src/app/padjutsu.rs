@@ -299,28 +299,51 @@ impl Padjutsu {
             .any(|st| buttons.iter().any(|btn| st.pressed.contains(*btn)))
     }
 
+    fn is_trackpad_zoom_active(
+        &self,
+        bindings: Option<&CompiledStickRules>,
+    ) -> bool {
+        let Some(bindings) = bindings else {
+            return false;
+        };
+        let mut buttons: Vec<Button> = Vec::new();
+        for mode in [bindings.left(), bindings.right()] {
+            if let Some(StickMode::TrackpadScroll(params)) = mode {
+                if let Some(button) = params.zoom_button {
+                    buttons.push(button);
+                }
+            }
+        }
+        self.controllers.values().any(|state| {
+            buttons.iter().any(|button| state.pressed.contains(*button))
+        })
+    }
+
     pub fn on_tick_with<F: FnMut(Effect)>(&mut self, sink: F) {
         let started_at = Instant::now();
         let bindings_owned = self.get_compiled_stick_rules().cloned();
         let precision = self.is_precision_active(bindings_owned.as_ref());
+        let trackpad_zoom = self.is_trackpad_zoom_active(bindings_owned.as_ref());
         self.axes_scratch.clear();
         self.axes_scratch.reserve(self.controllers.len());
         for (id, st) in self.controllers.iter() {
             self.axes_scratch.push((*id, st.axes));
         }
         print_debug!(
-            "stick tick: controllers={} axes_snapshots={} has_bindings={} active_repeats={} button_repeats={} precision={}",
+            "stick tick: controllers={} axes_snapshots={} has_bindings={} active_repeats={} button_repeats={} precision={} trackpad_zoom={}",
             self.controllers.len(),
             self.axes_scratch.len(),
             bindings_owned.is_some(),
             self.sticks.borrow().has_active_repeats(),
             self.button_repeats.len(),
-            precision
+            precision,
+            trackpad_zoom
         );
         self.sticks.borrow_mut().on_tick_with(
             bindings_owned.as_ref(),
             &self.axes_scratch,
             precision,
+            trackpad_zoom,
             sink,
         );
         print_debug!(

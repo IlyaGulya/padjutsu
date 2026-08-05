@@ -303,7 +303,7 @@ mod raw_modifier {
 #[cfg(target_os = "macos")]
 mod smooth_scroll {
     use core_graphics::event::{
-        CGEvent, CGEventTapLocation, EventField, ScrollEventUnit,
+        CGEvent, CGEventFlags, CGEventTapLocation, EventField, ScrollEventUnit,
     };
 
     use enigo::{Axis, InputError, InputResult};
@@ -334,19 +334,32 @@ mod smooth_scroll {
 
     pub fn post(axis: Axis, value: f64) -> InputResult<()> {
         match axis {
-            Axis::Horizontal => post_values(value, 0.0, false),
-            Axis::Vertical => post_values(0.0, value, false),
+            Axis::Horizontal => post_values(value, 0.0, false, false),
+            Axis::Vertical => post_values(0.0, value, false, false),
         }
     }
 
-    pub fn post_trackpad(horizontal: f64, vertical: f64) -> InputResult<()> {
-        post_values(horizontal, vertical, true)
+    pub fn post_trackpad(
+        horizontal: f64,
+        vertical: f64,
+        zoom: bool,
+    ) -> InputResult<()> {
+        post_values(horizontal, vertical, true, zoom)
+    }
+
+    fn trackpad_event_flags(zoom: bool) -> CGEventFlags {
+        if zoom {
+            CGEventFlags::CGEventFlagCommand
+        } else {
+            CGEventFlags::empty()
+        }
     }
 
     fn post_values(
         horizontal: f64,
         vertical: f64,
         continuous: bool,
+        zoom: bool,
     ) -> InputResult<()> {
         // Use cached thread-local CGEventSource (see `cg_source` module above)
         // to avoid allocating a fresh source per event.
@@ -401,9 +414,10 @@ mod smooth_scroll {
             EventField::EVENT_SOURCE_USER_DATA,
             enigo::EVENT_MARKER as i64,
         );
+        event.set_flags(trackpad_event_flags(zoom));
         event.post(CGEventTapLocation::HID);
         debug!(
-            "[smooth_scroll] posted horizontal={horizontal:.3} vertical={vertical:.3} continuous={continuous}"
+            "[smooth_scroll] posted horizontal={horizontal:.3} vertical={vertical:.3} continuous={continuous} zoom={zoom}"
         );
         Ok(())
     }
@@ -424,6 +438,13 @@ mod smooth_scroll {
                     continuous: 1,
                 }
             );
+        }
+
+        #[test]
+        fn zoom_trackpad_event_carries_command_flag() {
+            assert!(trackpad_event_flags(true)
+                .contains(CGEventFlags::CGEventFlagCommand));
+            assert!(trackpad_event_flags(false).is_empty());
         }
     }
 }
@@ -519,8 +540,9 @@ impl Performer {
         &mut self,
         horizontal: f64,
         vertical: f64,
+        zoom: bool,
     ) -> InputResult<()> {
-        with_pool(|| smooth_scroll::post_trackpad(horizontal, vertical))
+        with_pool(|| smooth_scroll::post_trackpad(horizontal, vertical, zoom))
     }
 
     /// Fallback for non-macOS systems
@@ -539,6 +561,7 @@ impl Performer {
         &mut self,
         horizontal: f64,
         vertical: f64,
+        _zoom: bool,
     ) -> InputResult<()> {
         self.enigo
             .scroll(horizontal.round() as i32, Axis::Horizontal)?;

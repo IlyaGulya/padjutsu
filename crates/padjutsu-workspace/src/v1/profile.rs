@@ -109,6 +109,8 @@ pub(crate) struct ProfileV1Stick {
     #[serde(default)]
     pub axis_lock: Option<bool>,
     #[serde(default)]
+    pub zoom_button: Option<String>,
+    #[serde(default)]
     pub trigger_boost_max: Option<f32>,
     #[serde(default)]
     pub trigger_boost_gamma: Option<f32>,

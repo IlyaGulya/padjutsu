@@ -337,6 +337,7 @@ fn parse_stick_mode(raw: ProfileV1Stick) -> Result<StickMode, Error> {
                 axis_lock: raw.axis_lock.unwrap_or(false),
                 invert_x: raw.invert_x.unwrap_or(false),
                 invert_y: raw.invert_y.unwrap_or(false),
+                zoom_button: None,
                 runtime: ScrollRuntimeParams {
                     tick_ms: raw.tick_ms.unwrap_or(4),
                     smoothing_window_ms: raw.smoothing_window_ms.unwrap_or(25),
@@ -348,6 +349,11 @@ fn parse_stick_mode(raw: ProfileV1Stick) -> Result<StickMode, Error> {
             StickMode::Scroll(params)
         }
         "trackpad_scroll" => {
+            let zoom_button = raw
+                .zoom_button
+                .as_deref()
+                .map(parse_button_name)
+                .transpose()?;
             let params = ScrollParams {
                 deadzone,
                 speed_lines_s: raw.speed_lines_s.unwrap_or(100.0),
@@ -355,6 +361,7 @@ fn parse_stick_mode(raw: ProfileV1Stick) -> Result<StickMode, Error> {
                 axis_lock: raw.axis_lock.unwrap_or(false),
                 invert_x: raw.invert_x.unwrap_or(false),
                 invert_y: raw.invert_y.unwrap_or(false),
+                zoom_button,
                 runtime: ScrollRuntimeParams {
                     tick_ms: raw.tick_ms.unwrap_or(4),
                     smoothing_window_ms: raw.smoothing_window_ms.unwrap_or(25),

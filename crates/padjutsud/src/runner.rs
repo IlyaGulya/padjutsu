@@ -108,10 +108,11 @@ impl<'a> ActionRunner<'a> {
                     self.send(PerformerCmd::ScrollY(v));
                 }
             }
-            Effect::TrackpadScroll { h, v } => {
+            Effect::TrackpadScroll { h, v, zoom } => {
                 self.send(PerformerCmd::TrackpadScroll {
                     horizontal: h,
                     vertical: v,
+                    zoom,
                 });
             }
             Effect::Rumble { id, ms } => {
