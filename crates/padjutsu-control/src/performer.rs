@@ -8,6 +8,8 @@ use crate::KeyCombo;
 pub(crate) struct MouseMoveObservation {
     pub(crate) x: i32,
     pub(crate) y: i32,
+    pub(crate) posted_dx: i32,
+    pub(crate) posted_dy: i32,
     pub(crate) display_epoch: u64,
 }
 
@@ -117,6 +119,8 @@ mod display_configuration {
 
 #[cfg(target_os = "macos")]
 mod relative_mouse {
+    use std::time::{Duration, Instant};
+
     use core_graphics::{
         display::CGPoint,
         event::{
@@ -128,6 +132,77 @@ mod relative_mouse {
     use objc2_app_kit::NSEvent;
 
     use super::MouseMoveObservation;
+
+    const MAX_PREDICTED_LEAD_PX: f64 = 32.0;
+    const RESYNC_AFTER_IDLE: Duration = Duration::from_millis(50);
+
+    /// Keeps absolute Quartz events moving when WindowServer applies the
+    /// previous event late. The lead is bounded so a display edge can never
+    /// accumulate an arbitrarily long invisible catch-up tail.
+    #[derive(Debug, Default)]
+    pub(super) struct TargetTracker {
+        target: Option<CGPoint>,
+        last_post_at: Option<Instant>,
+        display_epoch: Option<u64>,
+    }
+
+    impl TargetTracker {
+        fn destination(
+            &mut self,
+            actual: CGPoint,
+            dx: i32,
+            dy: i32,
+            display_epoch: u64,
+            now: Instant,
+        ) -> CGPoint {
+            let idle = self.last_post_at.is_some_and(|last| {
+                now.saturating_duration_since(last) >= RESYNC_AFTER_IDLE
+            });
+            let display_changed = self.display_epoch != Some(display_epoch);
+            let target_too_far = self.target.is_some_and(|target| {
+                (target.x - actual.x).abs() > MAX_PREDICTED_LEAD_PX
+                    || (target.y - actual.y).abs() > MAX_PREDICTED_LEAD_PX
+            });
+            if self.target.is_none() || idle || display_changed || target_too_far {
+                self.target = Some(actual);
+            }
+
+            let target = self.target.unwrap_or(actual);
+            let base = CGPoint::new(
+                axis_base(actual.x, target.x, dx),
+                axis_base(actual.y, target.y, dy),
+            );
+            let requested = offset_point(base, dx, dy);
+            let destination = CGPoint::new(
+                requested.x.clamp(
+                    actual.x - MAX_PREDICTED_LEAD_PX,
+                    actual.x + MAX_PREDICTED_LEAD_PX,
+                ),
+                requested.y.clamp(
+                    actual.y - MAX_PREDICTED_LEAD_PX,
+                    actual.y + MAX_PREDICTED_LEAD_PX,
+                ),
+            );
+
+            self.target = Some(destination);
+            self.last_post_at = Some(now);
+            self.display_epoch = Some(display_epoch);
+            destination
+        }
+    }
+
+    fn axis_base(actual: f64, target: f64, delta: i32) -> f64 {
+        let pending = target - actual;
+        let delta = f64::from(delta);
+        if delta == 0.0
+            || (pending > 0.0 && delta < 0.0)
+            || (pending < 0.0 && delta > 0.0)
+        {
+            actual
+        } else {
+            target
+        }
+    }
 
     /// Mouse moves must remain coalescible. Under WindowServer load,
     /// non-coalesced events form a downstream queue that can keep moving the
@@ -142,7 +217,11 @@ mod relative_mouse {
     /// Cursor position is read in native Quartz coordinates. This avoids any
     /// dependence on cached display height or AppKit's screen-layout cache,
     /// which can become stale after monitor reconfiguration.
-    pub fn post(dx: i32, dy: i32) -> InputResult<MouseMoveObservation> {
+    pub fn post(
+        tracker: &mut TargetTracker,
+        dx: i32,
+        dy: i32,
+    ) -> InputResult<MouseMoveObservation> {
         let pressed = unsafe { NSEvent::pressedMouseButtons() };
 
         let (event_type, button) = if pressed & 1 > 0 {
@@ -153,19 +232,25 @@ mod relative_mouse {
             (CGEventType::MouseMoved, CGMouseButton::Left)
         };
 
-        let (point, event) = super::cg_source::with(|source| -> Result<_, ()> {
-            let point = CGEvent::new(source.clone())?.location();
-            let destination = offset_point(point, dx, dy);
-            let event = CGEvent::new_mouse_event(
-                source.clone(),
-                event_type,
-                destination,
-                button,
-            )?;
-            Ok((point, event))
-        })
-        .map_err(|_| InputError::Simulate("failed to create mouse source"))?
-        .map_err(|_| InputError::Simulate("failed creating relative mouse event"))?;
+        let display_epoch = super::display_configuration::epoch();
+        let now = Instant::now();
+        let (point, destination, event) =
+            super::cg_source::with(|source| -> Result<_, ()> {
+                let point = CGEvent::new(source.clone())?.location();
+                let destination =
+                    tracker.destination(point, dx, dy, display_epoch, now);
+                let event = CGEvent::new_mouse_event(
+                    source.clone(),
+                    event_type,
+                    destination,
+                    button,
+                )?;
+                Ok((point, destination, event))
+            })
+            .map_err(|_| InputError::Simulate("failed to create mouse source"))?
+            .map_err(|_| {
+                InputError::Simulate("failed creating relative mouse event")
+            })?;
 
         let (delta_x, delta_y) = movement_delta_fields(dx, dy);
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, delta_x);
@@ -179,7 +264,9 @@ mod relative_mouse {
         Ok(MouseMoveObservation {
             x: point.x.round() as i32,
             y: point.y.round() as i32,
-            display_epoch: super::display_configuration::epoch(),
+            posted_dx: (destination.x - point.x).round() as i32,
+            posted_dy: (destination.y - point.y).round() as i32,
+            display_epoch,
         })
     }
 
@@ -196,6 +283,8 @@ mod relative_mouse {
 
     #[cfg(test)]
     mod tests {
+        use std::time::{Duration, Instant};
+
         use super::*;
 
         #[test]
@@ -211,6 +300,86 @@ mod relative_mouse {
                 offset_point(CGPoint::new(757.0, 981.984_375), 12, -20);
             assert_eq!(destination.x, 769.0);
             assert_eq!(destination.y, 961.984_375);
+        }
+
+        #[test]
+        fn stale_quartz_position_accumulates_only_a_bounded_lead() {
+            let actual = CGPoint::new(100.0, 200.0);
+            let started_at = Instant::now();
+            let mut tracker = TargetTracker::default();
+
+            let first = tracker.destination(actual, 10, 0, 0, started_at);
+            let second = tracker.destination(
+                actual,
+                10,
+                0,
+                0,
+                started_at + Duration::from_millis(8),
+            );
+            let fifth = (2..5).fold(second, |_, tick| {
+                tracker.destination(
+                    actual,
+                    10,
+                    0,
+                    0,
+                    started_at + Duration::from_millis(tick * 8),
+                )
+            });
+
+            assert_eq!(first.x, 110.0);
+            assert_eq!(second.x, 120.0);
+            assert_eq!(fifth.x, 132.0);
+            assert_eq!(fifth.y, actual.y);
+        }
+
+        #[test]
+        fn reversing_direction_discards_unapplied_cursor_lead() {
+            let actual = CGPoint::new(100.0, 200.0);
+            let started_at = Instant::now();
+            let mut tracker = TargetTracker::default();
+            let _ = tracker.destination(actual, 20, 0, 0, started_at);
+            let reversed = tracker.destination(
+                actual,
+                -5,
+                0,
+                0,
+                started_at + Duration::from_millis(8),
+            );
+
+            assert_eq!(reversed.x, 95.0);
+        }
+
+        #[test]
+        fn idle_or_display_change_resynchronizes_with_live_cursor() {
+            let started_at = Instant::now();
+            let mut tracker = TargetTracker::default();
+            let _ = tracker.destination(
+                CGPoint::new(100.0, 200.0),
+                20,
+                0,
+                0,
+                started_at,
+            );
+
+            let after_idle = tracker.destination(
+                CGPoint::new(500.0, 600.0),
+                4,
+                0,
+                0,
+                started_at + Duration::from_millis(100),
+            );
+            let after_display_change = tracker.destination(
+                CGPoint::new(-300.0, 50.0),
+                4,
+                0,
+                1,
+                started_at + Duration::from_millis(108),
+            );
+
+            assert_eq!(after_idle.x, 504.0);
+            assert_eq!(after_idle.y, 600.0);
+            assert_eq!(after_display_change.x, -296.0);
+            assert_eq!(after_display_change.y, 50.0);
         }
     }
 }
@@ -585,6 +754,8 @@ pub struct Performer {
     enigo: Enigo,
     #[cfg(target_os = "macos")]
     _display_observer: Option<display_configuration::Observer>,
+    #[cfg(target_os = "macos")]
+    mouse_target: relative_mouse::TargetTracker,
 }
 
 // SAFETY: This is safe because we're only accessing Enigo through a Mutex,
@@ -622,6 +793,8 @@ impl Performer {
             enigo,
             #[cfg(target_os = "macos")]
             _display_observer: display_configuration::Observer::register(),
+            #[cfg(target_os = "macos")]
+            mouse_target: relative_mouse::TargetTracker::default(),
         })
     }
 
@@ -653,7 +826,7 @@ impl Performer {
         x: i32,
         y: i32,
     ) -> InputResult<Option<MouseMoveObservation>> {
-        with_pool(|| relative_mouse::post(x, y)).map(Some)
+        with_pool(|| relative_mouse::post(&mut self.mouse_target, x, y)).map(Some)
     }
 
     /// Fallback for non-macOS systems.

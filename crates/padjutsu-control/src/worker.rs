@@ -528,6 +528,8 @@ struct WorkerMetrics {
     mouse_input_age: TimingStats,
     mouse_delta_axis: ValueStats,
     mouse_delta_change_axis: ValueStats,
+    mouse_posted_delta_axis: ValueStats,
+    mouse_prediction_extra_axis: ValueStats,
     cursor_tracking_error_axis: ValueStats,
     cursor_stalled: u64,
     display_reconfiguration_events: u64,
@@ -567,6 +569,8 @@ impl WorkerMetrics {
             mouse_input_age: TimingStats::default(),
             mouse_delta_axis: ValueStats::default(),
             mouse_delta_change_axis: ValueStats::default(),
+            mouse_posted_delta_axis: ValueStats::default(),
+            mouse_prediction_extra_axis: ValueStats::default(),
             cursor_tracking_error_axis: ValueStats::default(),
             cursor_stalled: 0,
             display_reconfiguration_events: 0,
@@ -663,6 +667,20 @@ impl WorkerMetrics {
             self.mouse_delta_change_axis.record(change_axis);
         }
 
+        let posted_delta = observation
+            .map(|observation| (observation.posted_dx, observation.posted_dy))
+            .unwrap_or((dx, dy));
+        self.mouse_posted_delta_axis.record(u64::from(
+            posted_delta
+                .0
+                .unsigned_abs()
+                .max(posted_delta.1.unsigned_abs()),
+        ));
+        self.mouse_prediction_extra_axis.record(
+            i64::from(posted_delta.0)
+                .abs_diff(i64::from(dx))
+                .max(i64::from(posted_delta.1).abs_diff(i64::from(dy))),
+        );
         if let Some(observation) = observation {
             if let Some(previous_epoch) = self.last_display_epoch {
                 if observation.display_epoch != previous_epoch {
@@ -695,7 +713,7 @@ impl WorkerMetrics {
             }
             self.last_cursor = Some((observation.x, observation.y));
         }
-        self.last_mouse_delta = Some((dx, dy));
+        self.last_mouse_delta = Some(posted_delta);
     }
 
     fn record_coalesced(&mut self, count: usize) {
@@ -723,7 +741,7 @@ impl WorkerMetrics {
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         padjutsu_metrics::metric!(
             "performer",
-            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} display_epoch={} display_reconfiguration_events={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
+            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) mouse_posted_delta_axis_px({}) mouse_prediction_extra_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} display_epoch={} display_reconfiguration_events={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
             self.started_at.elapsed().as_millis(),
             self.batches,
             self.commands,
@@ -743,6 +761,8 @@ impl WorkerMetrics {
             self.mouse_input_age.summary(),
             self.mouse_delta_axis.summary(),
             self.mouse_delta_change_axis.summary(),
+            self.mouse_posted_delta_axis.summary(),
+            self.mouse_prediction_extra_axis.summary(),
             self.cursor_tracking_error_axis.summary(),
             self.cursor_stalled,
             self.last_display_epoch.unwrap_or(0),
@@ -953,6 +973,8 @@ mod tests {
             Some(MouseMoveObservation {
                 x: 100,
                 y: 100,
+                posted_dx: 5,
+                posted_dy: 0,
                 display_epoch: 0,
             }),
         );
@@ -965,12 +987,16 @@ mod tests {
             Some(MouseMoveObservation {
                 x: 100,
                 y: 100,
+                posted_dx: 10,
+                posted_dy: 0,
                 display_epoch: 0,
             }),
         );
 
         assert_eq!(metrics.cursor_stalled, 1);
         assert_eq!(metrics.cursor_tracking_error_axis.max, 5);
+        assert_eq!(metrics.mouse_posted_delta_axis.max, 10);
+        assert_eq!(metrics.mouse_prediction_extra_axis.max, 5);
         assert_eq!(metrics.mouse_post_interval.max_us, 8_000);
         assert_eq!(metrics.max_mouse_commands_per_post, 2);
     }
@@ -1000,6 +1026,8 @@ mod tests {
             Some(MouseMoveObservation {
                 x: 100,
                 y: 100,
+                posted_dx: 5,
+                posted_dy: 0,
                 display_epoch: 0,
             }),
         );
@@ -1012,6 +1040,8 @@ mod tests {
             Some(MouseMoveObservation {
                 x: 500,
                 y: 500,
+                posted_dx: 5,
+                posted_dy: 0,
                 display_epoch: 1,
             }),
         );
