@@ -1129,6 +1129,7 @@ dependencies = [
  "log",
  "objc2",
  "objc2-app-kit",
+ "padjutsu-metrics",
  "serde",
  "smallvec",
 ]
@@ -1142,8 +1143,16 @@ dependencies = [
  "ctrlc",
  "padjutsu-bit-derive",
  "padjutsu-bit-mask",
+ "padjutsu-metrics",
  "sdl2",
  "thiserror",
+]
+
+[[package]]
+name = "padjutsu-metrics"
+version = "0.0.0"
+dependencies = [
+ "chrono",
 ]
 
 [[package]]
@@ -1187,6 +1196,7 @@ dependencies = [
  "padjutsu-bit-mask",
  "padjutsu-control",
  "padjutsu-gamepad",
+ "padjutsu-metrics",
  "padjutsu-workspace",
  "smallvec",
  "thiserror",

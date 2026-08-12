@@ -721,7 +721,8 @@ impl WorkerMetrics {
             return;
         }
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
-        eprintln!(
+        padjutsu_metrics::metric!(
+            "performer",
             "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} display_epoch={} display_reconfiguration_events={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
             self.started_at.elapsed().as_millis(),
             self.batches,
@@ -768,18 +769,11 @@ impl WorkerMetrics {
 }
 
 fn metrics_enabled() -> bool {
-    std::env::var("PADJUTSU_METRICS")
-        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+    padjutsu_metrics::enabled()
 }
 
 fn metrics_report_interval() -> Duration {
-    let seconds = std::env::var("PADJUTSU_METRICS_INTERVAL_S")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(60)
-        .clamp(5, 3_600);
-    Duration::from_secs(seconds)
+    padjutsu_metrics::report_interval()
 }
 
 // --- macOS realtime priority for the performer worker thread ---

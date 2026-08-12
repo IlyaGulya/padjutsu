@@ -21,6 +21,7 @@ crossbeam-channel = { workspace = true }
 padjutsu-bit-derive = { workspace = true }
 padjutsu-bit-mask = { workspace = true }
 ahash = { workspace = true }
+padjutsu-metrics = { workspace = true }
 
 [dev-dependencies]
 ctrlc = { workspace = true }

@@ -16,6 +16,7 @@ log = "0.4"
 serde = { workspace = true, features = ["derive"] }
 smallvec = "1.13"
 crossbeam-channel = { workspace = true }
+padjutsu-metrics = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.25", features = ["highsierra"] }

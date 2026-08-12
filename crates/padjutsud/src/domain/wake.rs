@@ -152,7 +152,8 @@ impl WakeMetrics {
         } else {
             self.lateness_total_us / u128::from(self.lateness_samples)
         };
-        eprintln!(
+        padjutsu_metrics::metric!(
+            "wake",
             "[wake-metrics] window_ms={} wakes={} tick_wakes={} early_wakes={} lateness_us(n={},avg={},p95~{},p99~{},max={}) over_1ms={} over_4ms={} over_8ms={} over_16ms={} axis_snapshot_corrections={}",
             self.started_at.elapsed().as_millis(),
             self.wakes,
@@ -174,18 +175,11 @@ impl WakeMetrics {
 }
 
 fn metrics_enabled() -> bool {
-    std::env::var("PADJUTSU_METRICS")
-        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+    padjutsu_metrics::enabled()
 }
 
 fn metrics_report_interval() -> Duration {
-    let seconds = std::env::var("PADJUTSU_METRICS_INTERVAL_S")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(60)
-        .clamp(5, 3_600);
-    Duration::from_secs(seconds)
+    padjutsu_metrics::report_interval()
 }
 
 pub fn apply_wake_intents(wake_state: &mut WakeState, intents: Vec<WakeTransition>) {

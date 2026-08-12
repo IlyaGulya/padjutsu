@@ -2,6 +2,7 @@
 members = [
   "crates/padjutsu-control",
   "crates/padjutsu-gamepad",
+  "crates/padjutsu-metrics",
   "crates/padjutsu-workspace",
   "crates/padjutsu-bit/derive",
   "crates/padjutsu-bit/mask",
@@ -23,6 +24,7 @@ license = "MIT"
 padjutsud = { path = "crates/padjutsud" }
 padjutsu-control = { path = "crates/padjutsu-control" }
 padjutsu-gamepad = { path = "crates/padjutsu-gamepad" }
+padjutsu-metrics = { path = "crates/padjutsu-metrics" }
 padjutsu-workspace = { path = "crates/padjutsu-workspace" }
 padjutsu-bit-derive = { path = "crates/padjutsu-bit/derive" }
 padjutsu-bit-mask = { path = "crates/padjutsu-bit/mask" }

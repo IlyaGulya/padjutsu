@@ -17,16 +17,11 @@ use crate::types::Axis;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
-    let on = std::env::var("PADJUTSU_METRICS")
-        .map(|value| {
-            value != "0"
-                && !value.eq_ignore_ascii_case("false")
-                && !value.eq_ignore_ascii_case("no")
-        })
-        .unwrap_or(true);
+    let on = padjutsu_metrics::enabled();
     ENABLED.store(on, Ordering::Relaxed);
     if on {
-        eprintln!(
+        padjutsu_metrics::metric!(
+            "gamepad",
             "[padjutsu-metrics] production metrics enabled; interval={}s",
             metrics_report_interval().as_secs()
         );
@@ -240,7 +235,8 @@ impl Metrics {
     }
 
     fn report(&mut self, now: Instant) {
-        eprintln!(
+        padjutsu_metrics::metric!(
+            "gamepad",
             "[padjutsu-metrics] interval={}s axis_events={} button_events={} subscriber_drops={}",
             self.report_interval.as_secs(),
             self.axis_events,
@@ -252,7 +248,8 @@ impl Metrics {
             if h.n == 0 && h.pauses() == 0 {
                 continue;
             }
-            eprintln!(
+            padjutsu_metrics::metric!(
+                "gamepad",
                 "[padjutsu-metrics]   axis {} dt: active_n={} pauses={} min={}us avg={}us p50<={}us p95<={}us p99<={}us max={}us",
                 axis_label(i),
                 h.n,
@@ -267,7 +264,8 @@ impl Metrics {
         }
         if self.broadcast_cost.n > 0 {
             let h = &self.broadcast_cost;
-            eprintln!(
+            padjutsu_metrics::metric!(
+                "gamepad",
                 "[padjutsu-metrics]   broadcast cost: n={} avg={}us p95<={}us p99<={}us max={}us",
                 h.n,
                 h.avg_us(),
@@ -278,7 +276,8 @@ impl Metrics {
         }
         if self.loop_gap.n > 0 {
             let h = &self.loop_gap;
-            eprintln!(
+            padjutsu_metrics::metric!(
+                "gamepad",
                 "[padjutsu-metrics]   sdl_loop_gap: n={} avg={}us p95<={}us p99<={}us max={}us",
                 h.n,
                 h.avg_us(),
@@ -301,12 +300,7 @@ impl Metrics {
 }
 
 fn metrics_report_interval() -> Duration {
-    let seconds = std::env::var("PADJUTSU_METRICS_INTERVAL_S")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(60)
-        .clamp(5, 3_600);
-    Duration::from_secs(seconds)
+    padjutsu_metrics::report_interval()
 }
 
 #[cfg(test)]

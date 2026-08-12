@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 padjutsu-gamepad = { workspace = true }
+padjutsu-metrics = { workspace = true }
 padjutsu-control = { workspace = true }
 padjutsu-workspace = { workspace = true }
 padjutsu-bit-mask = { workspace = true }

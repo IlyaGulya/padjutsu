@@ -254,7 +254,8 @@ impl StickProcessor {
                     >= Self::metrics_report_interval()
             });
         if should_report {
-            eprintln!(
+            padjutsu_metrics::metric!(
+                "stick",
                 "[stick-metrics] samples={} expected_tick_us={} tick_interval_us({}) tick_execution_us({}) gap_over_1_5x={} gap_over_2x={} gap_over_4x={} missed_periods={} mouse_mode_ticks={} mouse_move_events={} mouse_zero_move_ticks={} mouse_distance_total={:.1} mouse_chunk_max={} mouse_chunk_over_8={} mouse_chunk_over_16={} mouse_chunk_over_32={} scroll_events={} trackpad_scroll_events={}",
                 self.perf.samples,
                 self.perf.expected_tick_us,
@@ -288,25 +289,11 @@ impl StickProcessor {
     }
 
     fn metrics_enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("PADJUTSU_METRICS")
-                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-                .unwrap_or(true)
-        })
+        padjutsu_metrics::enabled()
     }
 
     fn metrics_report_interval() -> std::time::Duration {
-        static INTERVAL: std::sync::OnceLock<std::time::Duration> =
-            std::sync::OnceLock::new();
-        *INTERVAL.get_or_init(|| {
-            let seconds = std::env::var("PADJUTSU_METRICS_INTERVAL_S")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(60)
-                .clamp(5, 3_600);
-            std::time::Duration::from_secs(seconds)
-        })
+        padjutsu_metrics::report_interval()
     }
 
     fn expected_tick_us(bindings: &CompiledStickRules) -> u64 {

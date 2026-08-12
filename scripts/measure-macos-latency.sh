@@ -5,7 +5,7 @@ duration=${1:-15}
 label=${PADJUTSU_LAUNCHD_LABEL:-me.gulya.padjutsu}
 domain="gui/$(id -u)"
 service="$domain/$label"
-error_log=${PADJUTSU_ERROR_LOG:-/tmp/padjutsu.err}
+metrics_log=${PADJUTSU_METRICS_LOG:-"$HOME/Library/Logs/padjutsu/metrics.jsonl"}
 
 case "$duration" in
     ''|*[!0-9]*)
@@ -27,8 +27,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 start_line=0
-if [ -f "$error_log" ]; then
-    start_line=$(wc -l < "$error_log" | tr -d ' ')
+if [ -f "$metrics_log" ]; then
+    start_line=$(wc -l < "$metrics_log" | tr -d ' ')
 fi
 
 launchctl setenv PADJUTSU_METRICS 1
@@ -68,12 +68,12 @@ fi
 
 echo
 echo "Metrics:"
-if [ -f "$error_log" ]; then
-    sed -n "$((start_line + 1)),\$p" "$error_log" \
+if [ -f "$metrics_log" ]; then
+    sed -n "$((start_line + 1)),\$p" "$metrics_log" \
         | grep -E '\[(padjutsu|performer|stick|wake)-metrics\]' \
         || echo "No active stick samples were recorded."
 else
-    echo "No error log found at $error_log."
+    echo "No metrics log found at $metrics_log."
 fi
 
 if [ -f "$sample_file" ]; then

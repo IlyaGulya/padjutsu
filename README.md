@@ -151,15 +151,26 @@ The process must be allowed under System Settings → Privacy & Security → Acc
 
 ## Production latency metrics
 
-Release builds keep low-overhead latency metrics enabled. Aggregated reports are
-written to stderr every 60 seconds and cover SDL scheduling, dropped controller
-events, timer deadline lateness, stick tick gaps, performer queueing, mouse post
-cadence/deltas, and observed cursor tracking error.
+Release builds keep an always-on, low-overhead flight recorder. Every five
+seconds it snapshots SDL scheduling, dropped controller events, timer deadline
+lateness, stick tick gaps, performer queueing, mouse post cadence/deltas, display
+reconfigurations, and observed cursor tracking error. Producers use a bounded
+non-blocking queue, so slow disk I/O cannot delay controller input.
+
+History is timestamped JSONL in
+`~/Library/Logs/padjutsu/metrics.jsonl`. It rotates at 32 MiB and retains eight
+files in total (256 MiB by default).
 
 ```bash
+padjutsud metrics --since-minutes 15
+padjutsud metrics --at "2026-08-12 16:30:00" --window-minutes 2
+padjutsud metrics --since-minutes 30 --incidents-only
+padjutsud metrics --mark "felt mouse lag"
 just measure-latency 15              # temporary 5s reports + macOS sample
 PADJUTSU_METRICS=0 padjutsud run     # disable metrics
 PADJUTSU_METRICS_INTERVAL_S=300 ...  # report every five minutes
+PADJUTSU_METRICS_MAX_BYTES=67108864 ...
+PADJUTSU_METRICS_MAX_FILES=16 ...
 ```
 
 ## License

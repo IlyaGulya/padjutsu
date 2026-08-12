@@ -9,10 +9,12 @@ mod runner;
 mod accessibility;
 
 use std::fs::File;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::{process, time::Duration};
 
 use clap::Parser;
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use colored::Colorize;
 use crossbeam_channel::{select, unbounded};
 use lunchctl::{LaunchAgent, LaunchControllable};
@@ -45,6 +47,19 @@ fn main() -> process::ExitCode {
     match cli.command {
         Command::Run { workspace } => {
             let workspace_path = resolve_workspace_path(workspace.as_deref());
+            match padjutsu_metrics::init_default() {
+                Ok(path) => padjutsu_metrics::metric!(
+                    "service",
+                    "[service-metrics] event=start pid={} version={} interval_s={} recorder={}",
+                    std::process::id(),
+                    env!("CARGO_PKG_VERSION"),
+                    padjutsu_metrics::report_interval().as_secs(),
+                    path.display(),
+                ),
+                Err(error) => {
+                    print_error!("failed to start metrics flight recorder: {error}");
+                }
+            }
             #[cfg(target_os = "macos")]
             {
                 let _ = accessibility::request_if_needed();
@@ -153,6 +168,33 @@ fn main() -> process::ExitCode {
             }
             run_event_loop(None);
         }
+        Command::Metrics {
+            since_minutes,
+            at,
+            window_minutes,
+            incidents_only,
+            mark,
+        } => {
+            if let Some(marker) = mark {
+                match padjutsu_metrics::append_marker(&marker) {
+                    Ok(path) => {
+                        print_info!("incident marker written to {}", path.display())
+                    }
+                    Err(error) => {
+                        print_error!("failed to write incident marker: {error}");
+                        return process::ExitCode::FAILURE;
+                    }
+                }
+            } else if let Err(error) = print_metrics_window(
+                since_minutes,
+                at.as_deref(),
+                window_minutes,
+                incidents_only,
+            ) {
+                print_error!("failed to read metrics: {error}");
+                return process::ExitCode::FAILURE;
+            }
+        }
         Command::Command { workspace, command } => match command {
             ControlCommand::Rumble { id, ms } => {
                 let workspace_path = resolve_workspace_path(workspace.as_deref());
@@ -171,6 +213,75 @@ fn main() -> process::ExitCode {
     }
 
     process::ExitCode::SUCCESS
+}
+
+fn print_metrics_window(
+    since_minutes: u64,
+    at: Option<&str>,
+    window_minutes: u64,
+    incidents_only: bool,
+) -> Result<(), String> {
+    let now_ms = Local::now().timestamp_millis().max(0) as u128;
+    let minute_ms = 60_000_u128;
+    let (from_ms, to_ms) = if let Some(at) = at {
+        let center_ms = parse_metrics_time(at)?;
+        let radius = u128::from(window_minutes).saturating_mul(minute_ms);
+        (
+            center_ms.saturating_sub(radius),
+            center_ms.saturating_add(radius),
+        )
+    } else {
+        (
+            now_ms
+                .saturating_sub(u128::from(since_minutes).saturating_mul(minute_ms)),
+            now_ms,
+        )
+    };
+    let path = padjutsu_metrics::RecorderConfig::from_env().path;
+    let lines = padjutsu_metrics::read_window(&path, from_ms, to_ms)
+        .map_err(|error| error.to_string())?;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(
+        stdout,
+        "metrics={} from_unix_ms={} to_unix_ms={} incidents_only={}",
+        path.display(),
+        from_ms,
+        to_ms,
+        incidents_only,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut shown = 0_u64;
+    for line in lines {
+        let incident = padjutsu_metrics::classify_incident(&line);
+        if incidents_only && incident.is_none() {
+            continue;
+        }
+        if let Some(cause) = incident {
+            write!(stdout, "cause={cause} ").map_err(|error| error.to_string())?;
+        }
+        writeln!(stdout, "{line}").map_err(|error| error.to_string())?;
+        shown += 1;
+    }
+    writeln!(stdout, "records={shown}").map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn parse_metrics_time(value: &str) -> Result<u128, String> {
+    if let Ok(value) = DateTime::parse_from_rfc3339(value) {
+        return Ok(value.timestamp_millis().max(0) as u128);
+    }
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+        let Ok(naive) = NaiveDateTime::parse_from_str(value, format) else {
+            continue;
+        };
+        let Some(local) = Local.from_local_datetime(&naive).single() else {
+            return Err(format!("ambiguous local time: {value}"));
+        };
+        return Ok(local.timestamp_millis().max(0) as u128);
+    }
+    Err(format!(
+        "unsupported time '{value}'; use 'YYYY-MM-DD HH:MM:SS' or RFC3339"
+    ))
 }
 
 fn resolve_workspace_path(workspace: Option<&str>) -> PathBuf {
