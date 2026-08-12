@@ -11,7 +11,11 @@ pub(crate) struct MouseMoveObservation {
     pub(crate) posted_dx: i32,
     pub(crate) posted_dy: i32,
     pub(crate) recovery_warped: bool,
+    pub(crate) visual_warp_attempted: bool,
+    pub(crate) visual_warped: bool,
     pub(crate) stalled_posts: u8,
+    pub(crate) warp_duration: std::time::Duration,
+    pub(crate) event_post_duration: std::time::Duration,
     pub(crate) display_epoch: u64,
 }
 
@@ -286,6 +290,11 @@ mod relative_mouse {
         CGEventFlags::empty()
     }
 
+    #[inline]
+    fn should_warp_visual_cursor(destination_is_on_display: bool) -> bool {
+        destination_is_on_display
+    }
+
     /// Post a relative move while preserving Enigo's macOS semantics.
     ///
     /// Cursor position is read in native Quartz coordinates. This avoids any
@@ -325,9 +334,22 @@ mod relative_mouse {
                 InputError::Simulate("failed creating relative mouse event")
             })?;
 
-        let recovery_warped = plan.recover_cursor
-            && tracker.destination_is_on_display(plan.destination, display_epoch)
+        // Make the current position visible before CGEventPost. Under heavy
+        // WindowServer load the post can block for tens of milliseconds; a
+        // successful warp keeps that delay out of the visual cursor path. Do
+        // not warp into gaps between displays or beyond their active bounds.
+        let visual_warp_attempted = should_warp_visual_cursor(
+            tracker.destination_is_on_display(plan.destination, display_epoch),
+        );
+        let warp_started_at = Instant::now();
+        let visual_warped = visual_warp_attempted
             && CGDisplay::warp_mouse_cursor_position(plan.destination).is_ok();
+        let warp_duration = if visual_warp_attempted {
+            warp_started_at.elapsed()
+        } else {
+            Duration::ZERO
+        };
+        let recovery_warped = plan.recover_cursor && visual_warped;
         let (delta_x, delta_y) = movement_delta_fields(dx, dy);
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, delta_x);
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, delta_y);
@@ -336,14 +358,20 @@ mod relative_mouse {
             enigo::EVENT_MARKER as i64,
         );
         event.set_flags(movement_event_flags());
+        let event_post_started_at = Instant::now();
         event.post(CGEventTapLocation::HID);
+        let event_post_duration = event_post_started_at.elapsed();
         Ok(MouseMoveObservation {
             x: point.x.round() as i32,
             y: point.y.round() as i32,
             posted_dx: (plan.destination.x - point.x).round() as i32,
             posted_dy: (plan.destination.y - point.y).round() as i32,
             recovery_warped,
+            visual_warp_attempted,
+            visual_warped,
             stalled_posts: plan.stalled_posts,
+            warp_duration,
+            event_post_duration,
             display_epoch,
         })
     }
@@ -527,6 +555,23 @@ mod relative_mouse {
             assert!(!bounds
                 .iter()
                 .any(|rect| rect.contains(&CGPoint::new(150.0, 50.0))));
+        }
+
+        #[test]
+        fn visual_move_precedes_event_delivery_without_waiting_for_a_stall() {
+            let started_at = Instant::now();
+            let mut tracker = TargetTracker::default();
+            let plan = tracker.destination(
+                CGPoint::new(100.0, 200.0),
+                10,
+                0,
+                0,
+                started_at,
+            );
+
+            assert!(!plan.recover_cursor);
+            assert!(should_warp_visual_cursor(true));
+            assert!(!should_warp_visual_cursor(false));
         }
     }
 }

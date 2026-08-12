@@ -201,7 +201,14 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     {
         return Some("input-or-performer-queue-drop");
     }
-    if value_after(line, "mouse_post_over_16ms=") > 0
+    if value_after(line, "mouse_warp_over_16ms=") > 0
+        || value_after(line, "mouse_warp_over_50ms=") > 0
+    {
+        return Some("windowserver-cursor-warp-stall");
+    }
+    if value_after(line, "mouse_event_post_over_16ms=") > 0
+        || value_after(line, "mouse_event_post_over_50ms=") > 0
+        || value_after(line, "mouse_post_over_16ms=") > 0
         || value_after(line, "mouse_post_over_50ms=") > 0
     {
         return Some("windowserver-event-post-stall");
@@ -453,6 +460,16 @@ mod tests {
         assert_eq!(
             classify_incident("{\"dropped_before\":3}"),
             Some("metrics-recorder-overflow")
+        );
+        assert_eq!(
+            classify_incident("mouse_warp_over_16ms=2 mouse_warp_over_50ms=0"),
+            Some("windowserver-cursor-warp-stall")
+        );
+        assert_eq!(
+            classify_incident(
+                "mouse_event_post_over_16ms=2 mouse_event_post_over_50ms=0"
+            ),
+            Some("windowserver-event-post-stall")
         );
         assert_eq!(
             classify_incident("mouse_post_over_16ms=2 mouse_post_over_50ms=0"),

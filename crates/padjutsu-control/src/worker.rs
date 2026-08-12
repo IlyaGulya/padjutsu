@@ -524,6 +524,17 @@ struct WorkerMetrics {
     mouse_post_over_4ms: u64,
     mouse_post_over_16ms: u64,
     mouse_post_over_50ms: u64,
+    mouse_visual_warp_attempts: u64,
+    mouse_visual_warps: u64,
+    mouse_visual_warp_failures: u64,
+    mouse_warp: TimingStats,
+    mouse_warp_over_4ms: u64,
+    mouse_warp_over_16ms: u64,
+    mouse_warp_over_50ms: u64,
+    mouse_event_post: TimingStats,
+    mouse_event_post_over_4ms: u64,
+    mouse_event_post_over_16ms: u64,
+    mouse_event_post_over_50ms: u64,
     mouse_post_interval: TimingStats,
     mouse_input_age: TimingStats,
     mouse_delta_axis: ValueStats,
@@ -567,6 +578,17 @@ impl WorkerMetrics {
             mouse_post_over_4ms: 0,
             mouse_post_over_16ms: 0,
             mouse_post_over_50ms: 0,
+            mouse_visual_warp_attempts: 0,
+            mouse_visual_warps: 0,
+            mouse_visual_warp_failures: 0,
+            mouse_warp: TimingStats::default(),
+            mouse_warp_over_4ms: 0,
+            mouse_warp_over_16ms: 0,
+            mouse_warp_over_50ms: 0,
+            mouse_event_post: TimingStats::default(),
+            mouse_event_post_over_4ms: 0,
+            mouse_event_post_over_16ms: 0,
+            mouse_event_post_over_50ms: 0,
             mouse_post_interval: TimingStats::default(),
             mouse_input_age: TimingStats::default(),
             mouse_delta_axis: ValueStats::default(),
@@ -686,6 +708,32 @@ impl WorkerMetrics {
                 .max(i64::from(posted_delta.1).abs_diff(i64::from(dy))),
         );
         if let Some(observation) = observation {
+            self.mouse_visual_warp_attempts +=
+                u64::from(observation.visual_warp_attempted);
+            self.mouse_visual_warps += u64::from(observation.visual_warped);
+            self.mouse_visual_warp_failures += u64::from(
+                observation.visual_warp_attempted && !observation.visual_warped,
+            );
+            if observation.visual_warp_attempted {
+                self.mouse_warp.record(observation.warp_duration);
+                self.mouse_warp_over_4ms +=
+                    u64::from(observation.warp_duration > Duration::from_millis(4));
+                self.mouse_warp_over_16ms +=
+                    u64::from(observation.warp_duration > Duration::from_millis(16));
+                self.mouse_warp_over_50ms +=
+                    u64::from(observation.warp_duration > Duration::from_millis(50));
+            }
+            self.mouse_event_post
+                .record(observation.event_post_duration);
+            self.mouse_event_post_over_4ms += u64::from(
+                observation.event_post_duration > Duration::from_millis(4),
+            );
+            self.mouse_event_post_over_16ms += u64::from(
+                observation.event_post_duration > Duration::from_millis(16),
+            );
+            self.mouse_event_post_over_50ms += u64::from(
+                observation.event_post_duration > Duration::from_millis(50),
+            );
             self.cursor_recovery_warps += u64::from(observation.recovery_warped);
             self.cursor_stall_sequence_max = self
                 .cursor_stall_sequence_max
@@ -749,7 +797,7 @@ impl WorkerMetrics {
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         padjutsu_metrics::metric!(
             "performer",
-            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) mouse_posted_delta_axis_px({}) mouse_prediction_extra_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} cursor_recovery_warps={} cursor_stall_sequence_max={} display_epoch={} display_reconfiguration_events={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
+            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_visual_warp_attempts={} mouse_visual_warps={} mouse_visual_warp_failures={} mouse_warp_us({}) mouse_warp_over_4ms={} mouse_warp_over_16ms={} mouse_warp_over_50ms={} mouse_event_post_us({}) mouse_event_post_over_4ms={} mouse_event_post_over_16ms={} mouse_event_post_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) mouse_posted_delta_axis_px({}) mouse_prediction_extra_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} cursor_recovery_warps={} cursor_stall_sequence_max={} display_epoch={} display_reconfiguration_events={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
             self.started_at.elapsed().as_millis(),
             self.batches,
             self.commands,
@@ -765,6 +813,17 @@ impl WorkerMetrics {
             self.mouse_post_over_4ms,
             self.mouse_post_over_16ms,
             self.mouse_post_over_50ms,
+            self.mouse_visual_warp_attempts,
+            self.mouse_visual_warps,
+            self.mouse_visual_warp_failures,
+            self.mouse_warp.summary(),
+            self.mouse_warp_over_4ms,
+            self.mouse_warp_over_16ms,
+            self.mouse_warp_over_50ms,
+            self.mouse_event_post.summary(),
+            self.mouse_event_post_over_4ms,
+            self.mouse_event_post_over_16ms,
+            self.mouse_event_post_over_50ms,
             self.mouse_post_interval.summary(),
             self.mouse_input_age.summary(),
             self.mouse_delta_axis.summary(),
@@ -986,7 +1045,11 @@ mod tests {
                 posted_dx: 5,
                 posted_dy: 0,
                 recovery_warped: false,
+                visual_warp_attempted: true,
+                visual_warped: true,
                 stalled_posts: 0,
+                warp_duration: Duration::from_millis(2),
+                event_post_duration: Duration::from_millis(3),
                 display_epoch: 0,
             }),
         );
@@ -1002,7 +1065,11 @@ mod tests {
                 posted_dx: 10,
                 posted_dy: 0,
                 recovery_warped: true,
+                visual_warp_attempted: true,
+                visual_warped: true,
                 stalled_posts: 2,
+                warp_duration: Duration::from_millis(10),
+                event_post_duration: Duration::from_millis(20),
                 display_epoch: 0,
             }),
         );
@@ -1012,6 +1079,12 @@ mod tests {
         assert_eq!(metrics.mouse_posted_delta_axis.max, 10);
         assert_eq!(metrics.mouse_prediction_extra_axis.max, 5);
         assert_eq!(metrics.cursor_recovery_warps, 1);
+        assert_eq!(metrics.mouse_visual_warp_attempts, 2);
+        assert_eq!(metrics.mouse_visual_warps, 2);
+        assert_eq!(metrics.mouse_visual_warp_failures, 0);
+        assert_eq!(metrics.mouse_warp_over_4ms, 1);
+        assert_eq!(metrics.mouse_event_post_over_4ms, 1);
+        assert_eq!(metrics.mouse_event_post_over_16ms, 1);
         assert_eq!(metrics.cursor_stall_sequence_max, 2);
         assert_eq!(metrics.mouse_post_interval.max_us, 8_000);
         assert_eq!(metrics.max_mouse_commands_per_post, 2);
@@ -1045,7 +1118,11 @@ mod tests {
                 posted_dx: 5,
                 posted_dy: 0,
                 recovery_warped: false,
+                visual_warp_attempted: false,
+                visual_warped: false,
                 stalled_posts: 0,
+                warp_duration: Duration::ZERO,
+                event_post_duration: Duration::ZERO,
                 display_epoch: 0,
             }),
         );
@@ -1061,7 +1138,11 @@ mod tests {
                 posted_dx: 5,
                 posted_dy: 0,
                 recovery_warped: false,
+                visual_warp_attempted: false,
+                visual_warped: false,
                 stalled_posts: 0,
+                warp_duration: Duration::ZERO,
+                event_post_duration: Duration::ZERO,
                 display_epoch: 1,
             }),
         );
