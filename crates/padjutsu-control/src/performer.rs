@@ -10,6 +10,8 @@ pub(crate) struct MouseMoveObservation {
     pub(crate) y: i32,
     pub(crate) posted_dx: i32,
     pub(crate) posted_dy: i32,
+    pub(crate) recovery_warped: bool,
+    pub(crate) stalled_posts: u8,
     pub(crate) display_epoch: u64,
 }
 
@@ -122,7 +124,7 @@ mod relative_mouse {
     use std::time::{Duration, Instant};
 
     use core_graphics::{
-        display::CGPoint,
+        display::{CGDisplay, CGPoint, CGRect},
         event::{
             CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
             EventField,
@@ -135,6 +137,17 @@ mod relative_mouse {
 
     const MAX_PREDICTED_LEAD_PX: f64 = 32.0;
     const RESYNC_AFTER_IDLE: Duration = Duration::from_millis(50);
+    // A stale position already confirms that the previous 8ms-tick event was
+    // accepted but not applied. Recover immediately instead of waiting for a
+    // second lost movement.
+    const RECOVER_AFTER_STALLED_POSTS: u8 = 1;
+
+    #[derive(Debug, Clone, Copy)]
+    struct MovePlan {
+        destination: CGPoint,
+        recover_cursor: bool,
+        stalled_posts: u8,
+    }
 
     /// Keeps absolute Quartz events moving when WindowServer applies the
     /// previous event late. The lead is bounded so a display edge can never
@@ -142,8 +155,12 @@ mod relative_mouse {
     #[derive(Debug, Default)]
     pub(super) struct TargetTracker {
         target: Option<CGPoint>,
+        last_actual: Option<CGPoint>,
+        stalled_posts: u8,
         last_post_at: Option<Instant>,
         display_epoch: Option<u64>,
+        display_bounds: Vec<CGRect>,
+        display_bounds_epoch: Option<u64>,
     }
 
     impl TargetTracker {
@@ -154,7 +171,7 @@ mod relative_mouse {
             dy: i32,
             display_epoch: u64,
             now: Instant,
-        ) -> CGPoint {
+        ) -> MovePlan {
             let idle = self.last_post_at.is_some_and(|last| {
                 now.saturating_duration_since(last) >= RESYNC_AFTER_IDLE
             });
@@ -163,7 +180,37 @@ mod relative_mouse {
                 (target.x - actual.x).abs() > MAX_PREDICTED_LEAD_PX
                     || (target.y - actual.y).abs() > MAX_PREDICTED_LEAD_PX
             });
-            if self.target.is_none() || idle || display_changed || target_too_far {
+            let pending = self
+                .target
+                .map(|target| CGPoint::new(target.x - actual.x, target.y - actual.y))
+                .unwrap_or_default();
+            let direction_reversed =
+                axis_reversed(pending.x, dx) || axis_reversed(pending.y, dy);
+            let actual_progressed = match self.last_actual {
+                Some(previous) => {
+                    (previous.x - actual.x).abs() >= 0.5
+                        || (previous.y - actual.y).abs() >= 0.5
+                }
+                None => true,
+            };
+            let had_pending = pending.x.abs() >= 0.5 || pending.y.abs() >= 0.5;
+            if idle
+                || display_changed
+                || direction_reversed
+                || actual_progressed
+                || !had_pending
+            {
+                self.stalled_posts = 0;
+            } else {
+                self.stalled_posts = self.stalled_posts.saturating_add(1);
+            }
+
+            if self.target.is_none()
+                || idle
+                || display_changed
+                || direction_reversed
+                || target_too_far
+            {
                 self.target = Some(actual);
             }
 
@@ -185,10 +232,37 @@ mod relative_mouse {
             );
 
             self.target = Some(destination);
+            self.last_actual = Some(actual);
             self.last_post_at = Some(now);
             self.display_epoch = Some(display_epoch);
-            destination
+            MovePlan {
+                destination,
+                recover_cursor: self.stalled_posts >= RECOVER_AFTER_STALLED_POSTS,
+                stalled_posts: self.stalled_posts,
+            }
         }
+
+        fn destination_is_on_display(
+            &mut self,
+            destination: CGPoint,
+            display_epoch: u64,
+        ) -> bool {
+            if self.display_bounds_epoch != Some(display_epoch) {
+                self.display_bounds = CGDisplay::active_displays()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|id| CGDisplay::new(id).bounds())
+                    .collect();
+                self.display_bounds_epoch = Some(display_epoch);
+            }
+            self.display_bounds
+                .iter()
+                .any(|bounds| bounds.contains(&destination))
+        }
+    }
+
+    fn axis_reversed(pending: f64, delta: i32) -> bool {
+        (pending > 0.0 && delta < 0) || (pending < 0.0 && delta > 0)
     }
 
     fn axis_base(actual: f64, target: f64, delta: i32) -> f64 {
@@ -234,24 +308,26 @@ mod relative_mouse {
 
         let display_epoch = super::display_configuration::epoch();
         let now = Instant::now();
-        let (point, destination, event) =
+        let (point, plan, event) =
             super::cg_source::with(|source| -> Result<_, ()> {
                 let point = CGEvent::new(source.clone())?.location();
-                let destination =
-                    tracker.destination(point, dx, dy, display_epoch, now);
+                let plan = tracker.destination(point, dx, dy, display_epoch, now);
                 let event = CGEvent::new_mouse_event(
                     source.clone(),
                     event_type,
-                    destination,
+                    plan.destination,
                     button,
                 )?;
-                Ok((point, destination, event))
+                Ok((point, plan, event))
             })
             .map_err(|_| InputError::Simulate("failed to create mouse source"))?
             .map_err(|_| {
                 InputError::Simulate("failed creating relative mouse event")
             })?;
 
+        let recovery_warped = plan.recover_cursor
+            && tracker.destination_is_on_display(plan.destination, display_epoch)
+            && CGDisplay::warp_mouse_cursor_position(plan.destination).is_ok();
         let (delta_x, delta_y) = movement_delta_fields(dx, dy);
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, delta_x);
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, delta_y);
@@ -264,8 +340,10 @@ mod relative_mouse {
         Ok(MouseMoveObservation {
             x: point.x.round() as i32,
             y: point.y.round() as i32,
-            posted_dx: (destination.x - point.x).round() as i32,
-            posted_dy: (destination.y - point.y).round() as i32,
+            posted_dx: (plan.destination.x - point.x).round() as i32,
+            posted_dy: (plan.destination.y - point.y).round() as i32,
+            recovery_warped,
+            stalled_posts: plan.stalled_posts,
             display_epoch,
         })
     }
@@ -284,6 +362,8 @@ mod relative_mouse {
     #[cfg(test)]
     mod tests {
         use std::time::{Duration, Instant};
+
+        use core_graphics::display::CGSize;
 
         use super::*;
 
@@ -326,10 +406,11 @@ mod relative_mouse {
                 )
             });
 
-            assert_eq!(first.x, 110.0);
-            assert_eq!(second.x, 120.0);
-            assert_eq!(fifth.x, 132.0);
-            assert_eq!(fifth.y, actual.y);
+            assert_eq!(first.destination.x, 110.0);
+            assert_eq!(second.destination.x, 120.0);
+            assert_eq!(fifth.destination.x, 132.0);
+            assert_eq!(fifth.destination.y, actual.y);
+            assert!(fifth.recover_cursor);
         }
 
         #[test]
@@ -346,7 +427,8 @@ mod relative_mouse {
                 started_at + Duration::from_millis(8),
             );
 
-            assert_eq!(reversed.x, 95.0);
+            assert_eq!(reversed.destination.x, 95.0);
+            assert!(!reversed.recover_cursor);
         }
 
         #[test]
@@ -376,10 +458,75 @@ mod relative_mouse {
                 started_at + Duration::from_millis(108),
             );
 
-            assert_eq!(after_idle.x, 504.0);
-            assert_eq!(after_idle.y, 600.0);
-            assert_eq!(after_display_change.x, -296.0);
-            assert_eq!(after_display_change.y, 50.0);
+            assert_eq!(after_idle.destination.x, 504.0);
+            assert_eq!(after_idle.destination.y, 600.0);
+            assert!(!after_idle.recover_cursor);
+            assert_eq!(after_display_change.destination.x, -296.0);
+            assert_eq!(after_display_change.destination.y, 50.0);
+            assert!(!after_display_change.recover_cursor);
+        }
+
+        #[test]
+        fn cursor_recovery_handles_one_confirmed_stale_post_and_resets_on_progress()
+        {
+            let started_at = Instant::now();
+            let mut tracker = TargetTracker::default();
+
+            let first = tracker.destination(
+                CGPoint::new(100.0, 200.0),
+                10,
+                0,
+                0,
+                started_at,
+            );
+            let one_stale = tracker.destination(
+                CGPoint::new(100.0, 200.0),
+                10,
+                0,
+                0,
+                started_at + Duration::from_millis(8),
+            );
+            let two_stale = tracker.destination(
+                CGPoint::new(100.0, 200.0),
+                10,
+                0,
+                0,
+                started_at + Duration::from_millis(16),
+            );
+            let progressed = tracker.destination(
+                CGPoint::new(130.0, 200.0),
+                10,
+                0,
+                0,
+                started_at + Duration::from_millis(24),
+            );
+
+            assert!(!first.recover_cursor);
+            assert!(one_stale.recover_cursor);
+            assert_eq!(one_stale.stalled_posts, 1);
+            assert!(two_stale.recover_cursor);
+            assert_eq!(two_stale.stalled_posts, 2);
+            assert!(!progressed.recover_cursor);
+            assert_eq!(progressed.stalled_posts, 0);
+        }
+
+        #[test]
+        fn cursor_recovery_does_not_treat_display_gaps_as_warp_targets() {
+            let left =
+                CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(100.0, 100.0));
+            let right =
+                CGRect::new(&CGPoint::new(200.0, 0.0), &CGSize::new(100.0, 100.0));
+            let bounds = [left, right];
+
+            assert!(bounds
+                .iter()
+                .any(|rect| rect.contains(&CGPoint::new(50.0, 50.0))));
+            assert!(bounds
+                .iter()
+                .any(|rect| rect.contains(&CGPoint::new(250.0, 50.0))));
+            assert!(!bounds
+                .iter()
+                .any(|rect| rect.contains(&CGPoint::new(150.0, 50.0))));
         }
     }
 }

@@ -215,6 +215,9 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     {
         return Some("scheduler-starvation");
     }
+    if value_after(line, "cursor_recovery_warps=") > 0 {
+        return Some("cursor-recovered-after-stall");
+    }
     if value_after(line, "cursor_stalled=") >= 3
         && max_in_summary(line, "cursor_tracking_error_axis_px(") >= 8
     {
@@ -464,6 +467,12 @@ mod tests {
                 "cursor_tracking_error_axis_px(n=20,avg=2,max=12) cursor_stalled=4"
             ),
             Some("cursor-not-applied")
+        );
+        assert_eq!(
+            classify_incident(
+                "cursor_stalled=4 cursor_recovery_warps=1 cursor_stall_sequence_max=2"
+            ),
+            Some("cursor-recovered-after-stall")
         );
         assert_eq!(
             classify_incident(
