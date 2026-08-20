@@ -222,6 +222,10 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     if value_after(line, "queue_wait_over_4ms=") > 0 {
         return Some("performer-queue-stall");
     }
+    if line.contains("[resource-metrics]") && value_after(line, "major_faults=") > 0
+    {
+        return Some("process-major-page-fault");
+    }
     if value_after(line, "mouse_prediction_clamped=") > 0 {
         return Some("cursor-prediction-clamped");
     }
@@ -523,6 +527,12 @@ mod tests {
         assert_eq!(
             classify_incident("queue_wait_over_4ms=1 queue_wait_over_16ms=0"),
             Some("performer-queue-stall")
+        );
+        assert_eq!(
+            classify_incident(
+                "[resource-metrics] minor_faults=12 major_faults=1 involuntary_ctx_switches=8"
+            ),
+            Some("process-major-page-fault")
         );
     }
 

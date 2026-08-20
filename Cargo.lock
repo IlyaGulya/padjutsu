@@ -1190,6 +1190,7 @@ dependencies = [
  "enigo",
  "fd-lock",
  "fern",
+ "libc",
  "log",
  "lunchctl",
  "nsworkspace",

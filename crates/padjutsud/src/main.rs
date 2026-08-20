@@ -7,6 +7,8 @@ mod logging;
 mod runner;
 #[cfg(target_os = "macos")]
 mod accessibility;
+#[cfg(target_os = "macos")]
+mod resource_metrics;
 
 use std::fs::File;
 use std::io::Write as _;
@@ -60,6 +62,8 @@ fn main() -> process::ExitCode {
                     print_error!("failed to start metrics flight recorder: {error}");
                 }
             }
+            #[cfg(target_os = "macos")]
+            resource_metrics::spawn();
             #[cfg(target_os = "macos")]
             {
                 let _ = accessibility::request_if_needed();
