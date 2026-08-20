@@ -105,8 +105,19 @@ mod mach_rt {
 
         if kr == KERN_SUCCESS {
             eprintln!("[padjutsu-gamepad] real-time thread priority set (period=2ms computation=500us constraint=1ms)");
+            padjutsu_metrics::metric!(
+                "thread-policy",
+                "[thread-policy-metrics] name={} requested=time_constraint result=success",
+                std::thread::current().name().unwrap_or("gamepad-runtime"),
+            );
         } else {
             eprintln!("[padjutsu-gamepad] WARNING: failed to set real-time thread priority (kern_return={})", kr);
+            padjutsu_metrics::metric!(
+                "thread-policy",
+                "[thread-policy-metrics] name={} requested=time_constraint result=failure kern_return={}",
+                std::thread::current().name().unwrap_or("gamepad-runtime"),
+                kr,
+            );
         }
     }
 }
@@ -135,6 +146,7 @@ pub(crate) fn start_runtime_thread(
     ready_tx: Option<std::sync::mpsc::Sender<()>>,
 ) {
     thread::spawn(move || {
+        set_native_thread_name();
         set_realtime_priority();
         crate::metrics::init();
 
@@ -263,7 +275,10 @@ pub(crate) fn start_runtime_thread(
                     Event::ControllerButtonDown { which, button, .. } => {
                         if let Some(btn) = map_sdl_button(button) {
                             let id = which as ControllerId;
-                            if button_state.entry(id).or_default().insert(btn) {
+                            let emitted =
+                                button_state.entry(id).or_default().insert(btn);
+                            record_raw_button_metric(true, emitted);
+                            if emitted {
                                 broadcast(
                                     &inner,
                                     ControllerEvent::ButtonPressed {
@@ -277,10 +292,11 @@ pub(crate) fn start_runtime_thread(
                     Event::ControllerButtonUp { which, button, .. } => {
                         if let Some(btn) = map_sdl_button(button) {
                             let id = which as ControllerId;
-                            if button_state
+                            let emitted = button_state
                                 .get_mut(&id)
-                                .is_some_and(|s| s.remove(&btn))
-                            {
+                                .is_some_and(|s| s.remove(&btn));
+                            record_raw_button_metric(false, emitted);
+                            if emitted {
                                 broadcast(
                                     &inner,
                                     ControllerEvent::ButtonReleased {
@@ -403,7 +419,10 @@ pub(crate) fn start_runtime_thread(
                         Event::ControllerButtonDown { which, button, .. } => {
                             if let Some(btn) = map_sdl_button(button) {
                                 let id = which as ControllerId;
-                                if button_state.entry(id).or_default().insert(btn) {
+                                let emitted =
+                                    button_state.entry(id).or_default().insert(btn);
+                                record_raw_button_metric(true, emitted);
+                                if emitted {
                                     broadcast(
                                         &inner,
                                         ControllerEvent::ButtonPressed {
@@ -417,10 +436,11 @@ pub(crate) fn start_runtime_thread(
                         Event::ControllerButtonUp { which, button, .. } => {
                             if let Some(btn) = map_sdl_button(button) {
                                 let id = which as ControllerId;
-                                if button_state
+                                let emitted = button_state
                                     .get_mut(&id)
-                                    .is_some_and(|s| s.remove(&btn))
-                                {
+                                    .is_some_and(|s| s.remove(&btn));
+                                record_raw_button_metric(false, emitted);
+                                if emitted {
                                     broadcast(
                                         &inner,
                                         ControllerEvent::ButtonReleased {
@@ -539,6 +559,19 @@ pub(crate) fn start_runtime_thread(
         }
     });
 }
+
+#[cfg(target_os = "macos")]
+fn set_native_thread_name() {
+    use std::os::raw::{c_char, c_int};
+
+    unsafe extern "C" {
+        fn pthread_setname_np(name: *const c_char) -> c_int;
+    }
+    let _ = unsafe { pthread_setname_np(c"gamepad-runtime".as_ptr()) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_native_thread_name() {}
 
 fn map_sdl_button(button: SdlButton) -> Option<Button> {
     Some(match button {
@@ -689,6 +722,14 @@ fn metrics_tick() {
             let mut metrics = m.borrow_mut();
             metrics.record_loop_tick(Instant::now());
             metrics.maybe_report();
+        });
+    }
+}
+
+fn record_raw_button_metric(pressed: bool, emitted: bool) {
+    if crate::metrics::is_enabled() {
+        METRICS.with(|metrics| {
+            metrics.borrow_mut().record_raw_button(pressed, emitted)
         });
     }
 }

@@ -132,6 +132,10 @@ pub struct Metrics {
     last_loop_tick: Option<Instant>,
     subscriber_drops: u64,
     button_events: u64,
+    raw_button_down_events: u64,
+    raw_button_up_events: u64,
+    suppressed_duplicate_button_down: u64,
+    suppressed_duplicate_button_up: u64,
     axis_events: u64,
     last_report: Instant,
     report_interval: Duration,
@@ -147,6 +151,10 @@ impl Default for Metrics {
             last_loop_tick: None,
             subscriber_drops: 0,
             button_events: 0,
+            raw_button_down_events: 0,
+            raw_button_up_events: 0,
+            suppressed_duplicate_button_down: 0,
+            suppressed_duplicate_button_up: 0,
             axis_events: 0,
             last_report: Instant::now(),
             report_interval: metrics_report_interval(),
@@ -199,6 +207,19 @@ impl Metrics {
         self.button_events += 1;
     }
 
+    pub fn record_raw_button(&mut self, pressed: bool, emitted: bool) {
+        if !is_enabled() {
+            return;
+        }
+        if pressed {
+            self.raw_button_down_events += 1;
+            self.suppressed_duplicate_button_down += u64::from(!emitted);
+        } else {
+            self.raw_button_up_events += 1;
+            self.suppressed_duplicate_button_up += u64::from(!emitted);
+        }
+    }
+
     pub fn record_broadcast_cost(&mut self, dt: Duration) {
         if !is_enabled() {
             return;
@@ -237,10 +258,14 @@ impl Metrics {
     fn report(&mut self, now: Instant) {
         padjutsu_metrics::metric!(
             "gamepad",
-            "[padjutsu-metrics] interval={}s axis_events={} button_events={} subscriber_drops={}",
+            "[padjutsu-metrics] interval={}s axis_events={} button_events={} raw_button_down_events={} raw_button_up_events={} suppressed_duplicate_button_down={} suppressed_duplicate_button_up={} subscriber_drops={}",
             self.report_interval.as_secs(),
             self.axis_events,
             self.button_events,
+            self.raw_button_down_events,
+            self.raw_button_up_events,
+            self.suppressed_duplicate_button_down,
+            self.suppressed_duplicate_button_up,
             self.subscriber_drops,
         );
         for i in 0..6 {
@@ -293,6 +318,10 @@ impl Metrics {
         self.broadcast_cost.reset();
         self.loop_gap.reset();
         self.button_events = 0;
+        self.raw_button_down_events = 0;
+        self.raw_button_up_events = 0;
+        self.suppressed_duplicate_button_down = 0;
+        self.suppressed_duplicate_button_up = 0;
         self.axis_events = 0;
         self.subscriber_drops = 0;
         self.last_report = now;

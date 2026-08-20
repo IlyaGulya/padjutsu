@@ -190,6 +190,17 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     if line.contains("[service-metrics] event=start") {
         return Some("service-restart");
     }
+    if line.contains("[thread-policy-metrics]") && line.contains("result=failure") {
+        return Some("thread-policy-setup-failure");
+    }
+    if line.contains("[thread-resource-metrics]")
+        && (line.contains("name=event-loop ")
+            || line.contains("name=gamepad-runtime ")
+            || line.contains("name=performer-worker "))
+        && value_after(line, "policy=") != 2
+    {
+        return Some("realtime-thread-demoted");
+    }
     if value_after(line, "\"dropped_before\":") > 0 {
         return Some("metrics-recorder-overflow");
     }
@@ -198,6 +209,11 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     }
     if value_after(line, "button_repeat_snapshot_cancellations=") > 0 {
         return Some("stale-button-repeat-cancelled");
+    }
+    if value_after(line, "suppressed_duplicate_button_down=") > 0
+        || value_after(line, "suppressed_duplicate_button_up=") > 0
+    {
+        return Some("duplicate-gamepad-button-event");
     }
     if value_after(line, "subscriber_drops=") > 0
         || value_after(line, " dropped=") > 0
@@ -212,6 +228,11 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     if max_in_summary(line, "mouse_button_post_us(") > 16_000 {
         return Some("windowserver-button-post-stall");
     }
+    if line.contains("[mouse-button-metrics]")
+        && max_in_summary(line, "event_post_us(") > 16_000
+    {
+        return Some("windowserver-button-post-stall");
+    }
     if value_after(line, "mouse_event_post_over_16ms=") > 0
         || value_after(line, "mouse_event_post_over_50ms=") > 0
         || value_after(line, "mouse_post_over_16ms=") > 0
@@ -221,6 +242,16 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     }
     if value_after(line, "queue_wait_over_4ms=") > 0 {
         return Some("performer-queue-stall");
+    }
+    if line.contains("[performer-command-metrics]")
+        && value_after(line, "execution_over_16ms=") > 0
+    {
+        return Some("performer-command-stall");
+    }
+    if line.contains("[mouse-trace-metrics]")
+        && value_after(line, "end_to_end_us=") > 16_000
+    {
+        return Some("mouse-end-to-end-stall");
     }
     if line.contains("[resource-metrics]") && value_after(line, "major_faults=") > 0
     {
@@ -533,6 +564,42 @@ mod tests {
                 "[resource-metrics] minor_faults=12 major_faults=1 involuntary_ctx_switches=8"
             ),
             Some("process-major-page-fault")
+        );
+        assert_eq!(
+            classify_incident(
+                "[performer-command-metrics] kind=key_tap execution_over_16ms=1"
+            ),
+            Some("performer-command-stall")
+        );
+        assert_eq!(
+            classify_incident(
+                "[mouse-trace-metrics] event_post_us=9000 end_to_end_us=19000"
+            ),
+            Some("mouse-end-to-end-stall")
+        );
+        assert_eq!(
+            classify_incident(
+                "suppressed_duplicate_button_down=1 suppressed_duplicate_button_up=0"
+            ),
+            Some("duplicate-gamepad-button-event")
+        );
+        assert_eq!(
+            classify_incident(
+                "[mouse-button-metrics] kind=click event_post_us(n=1,avg=19000,max=19000)"
+            ),
+            Some("windowserver-button-post-stall")
+        );
+        assert_eq!(
+            classify_incident(
+                "[thread-resource-metrics] name=event-loop id=7 policy=1 run_state=3"
+            ),
+            Some("realtime-thread-demoted")
+        );
+        assert_eq!(
+            classify_incident(
+                "[thread-policy-metrics] name=performer-worker requested=time_constraint result=failure"
+            ),
+            Some("thread-policy-setup-failure")
         );
     }
 

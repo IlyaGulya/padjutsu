@@ -21,6 +21,18 @@ pub(crate) struct MouseMoveObservation {
     pub(crate) display_epoch: u64,
 }
 
+/// Correlation metadata carried from the performer queue to the native mouse
+/// delivery thread. `Instant` keeps this allocation-free and independent of
+/// wall-clock changes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MouseTrace {
+    pub(crate) first_sequence: u64,
+    pub(crate) last_sequence: u64,
+    pub(crate) command_count: usize,
+    pub(crate) input_enqueued_at: std::time::Instant,
+    pub(crate) performer_started_at: std::time::Instant,
+}
+
 /// Wrap a CG/Cocoa-using closure in a macOS autorelease pool so any
 /// internally-allocated CFData/NSObject autoreleased values are freed
 /// at the end of the call. Without a pool, those values accumulate in
@@ -143,7 +155,7 @@ mod relative_mouse {
     use enigo::{Button, InputError, InputResult};
     use objc2_app_kit::NSEvent;
 
-    use super::MouseMoveObservation;
+    use super::{MouseMoveObservation, MouseTrace};
 
     const RESYNC_AFTER_IDLE: Duration = Duration::from_millis(50);
     const DISPLAY_EDGE_EPSILON_PX: f64 = 0.001;
@@ -160,6 +172,7 @@ mod relative_mouse {
         dy: i32,
         generation: u64,
         enqueued_at: Instant,
+        trace: Option<MouseTrace>,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -169,9 +182,30 @@ mod relative_mouse {
         Release(Button),
     }
 
+    const BUTTON_KIND_COUNT: usize = 4;
+
+    impl ButtonCommand {
+        fn kind_index(self) -> usize {
+            match self {
+                Self::Click(_, 1) => 0,
+                Self::Click(_, _) => 1,
+                Self::Press(_) => 2,
+                Self::Release(_) => 3,
+            }
+        }
+    }
+
+    const BUTTON_KIND_LABELS: [&str; BUTTON_KIND_COUNT] =
+        ["click", "double_click", "press", "release"];
+
+    struct ButtonDeliveryCommand {
+        command: ButtonCommand,
+        enqueued_at: Instant,
+    }
+
     enum DeliveryMessage {
         Move(MoveCommand),
-        Button(ButtonCommand),
+        Button(ButtonDeliveryCommand),
     }
 
     pub(super) struct MouseEventDelivery {
@@ -213,13 +247,20 @@ mod relative_mouse {
             }
         }
 
-        fn submit(&self, dx: i32, dy: i32, generation: u64) {
+        fn submit(
+            &self,
+            dx: i32,
+            dy: i32,
+            generation: u64,
+            trace: Option<MouseTrace>,
+        ) {
             self.submitted.fetch_add(1, Ordering::Relaxed);
             let command = MoveCommand {
                 dx,
                 dy,
                 generation,
                 enqueued_at: Instant::now(),
+                trace,
             };
             if self.tx.try_send(DeliveryMessage::Move(command)).is_err() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -237,7 +278,10 @@ mod relative_mouse {
             if self
                 .tx
                 .send_timeout(
-                    DeliveryMessage::Button(command),
+                    DeliveryMessage::Button(ButtonDeliveryCommand {
+                        command,
+                        enqueued_at: Instant::now(),
+                    }),
                     Duration::from_millis(4),
                 )
                 .is_err()
@@ -263,6 +307,12 @@ mod relative_mouse {
         if result != 0 {
             eprintln!("[mouse-event-delivery] failed to set user-interactive QoS: {result}");
         }
+        padjutsu_metrics::metric!(
+            "thread-policy",
+            "[thread-policy-metrics] name=mouse-event-delivery requested=user_interactive_qos result={} native_result={}",
+            if result == 0 { "success" } else { "failure" },
+            result,
+        );
     }
 
     impl Drop for MouseEventDelivery {
@@ -278,6 +328,8 @@ mod relative_mouse {
     struct MovePlan {
         destination: CGPoint,
         stalled_posts: u8,
+        previous_progress_age: Option<Duration>,
+        previous_stall_age: Option<Duration>,
     }
 
     /// Tracks display bounds and whether WindowServer has applied the previous
@@ -334,6 +386,9 @@ mod relative_mouse {
                 None => true,
             };
             let had_pending = pending.x.abs() >= 0.5 || pending.y.abs() >= 0.5;
+            let previous_post_age = self
+                .last_post_at
+                .map(|last| now.saturating_duration_since(last));
             if idle
                 || display_changed
                 || direction_reversed
@@ -361,6 +416,12 @@ mod relative_mouse {
             MovePlan {
                 destination,
                 stalled_posts: self.stalled_posts,
+                previous_progress_age: (actual_progressed && had_pending)
+                    .then_some(previous_post_age)
+                    .flatten(),
+                previous_stall_age: (!actual_progressed && had_pending)
+                    .then_some(previous_post_age)
+                    .flatten(),
             }
         }
 
@@ -485,6 +546,10 @@ mod relative_mouse {
         u64::MAX,
     ];
 
+    fn duration_us(duration: Duration) -> u64 {
+        duration.as_micros().min(u128::from(u64::MAX)) as u64
+    }
+
     #[derive(Default)]
     struct DeliveryTimingStats {
         samples: u64,
@@ -546,6 +611,9 @@ mod relative_mouse {
         generation_cancelled: u64,
         button_commands: u64,
         button_post: DeliveryTimingStats,
+        button_queue_age: [DeliveryTimingStats; BUTTON_KIND_COUNT],
+        button_post_by_kind: [DeliveryTimingStats; BUTTON_KIND_COUNT],
+        button_commands_by_kind: [u64; BUTTON_KIND_COUNT],
         delivery_step_samples: u64,
         delivery_step_total_px: u64,
         delivery_step_max_px: u64,
@@ -559,6 +627,26 @@ mod relative_mouse {
         post_over_4ms: u64,
         post_over_16ms: u64,
         post_over_50ms: u64,
+        performer_queue_age: DeliveryTimingStats,
+        performer_submit: DeliveryTimingStats,
+        end_to_end: DeliveryTimingStats,
+        cursor_progress_observed_age: DeliveryTimingStats,
+        cursor_stall_observed_age: DeliveryTimingStats,
+        traced_commands: u64,
+        worst_trace: Option<WorstMouseTrace>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct WorstMouseTrace {
+        first_sequence: u64,
+        last_sequence: u64,
+        command_count: usize,
+        performer_queue_us: u64,
+        performer_submit_us: u64,
+        delivery_queue_us: u64,
+        event_post_us: u64,
+        end_to_end_us: u64,
+        stalled_posts: u8,
     }
 
     impl DeliveryMetrics {
@@ -571,6 +659,13 @@ mod relative_mouse {
                 generation_cancelled: 0,
                 button_commands: 0,
                 button_post: DeliveryTimingStats::default(),
+                button_queue_age: std::array::from_fn(|_| {
+                    DeliveryTimingStats::default()
+                }),
+                button_post_by_kind: std::array::from_fn(|_| {
+                    DeliveryTimingStats::default()
+                }),
+                button_commands_by_kind: [0; BUTTON_KIND_COUNT],
                 delivery_step_samples: 0,
                 delivery_step_total_px: 0,
                 delivery_step_max_px: 0,
@@ -584,6 +679,13 @@ mod relative_mouse {
                 post_over_4ms: 0,
                 post_over_16ms: 0,
                 post_over_50ms: 0,
+                performer_queue_age: DeliveryTimingStats::default(),
+                performer_submit: DeliveryTimingStats::default(),
+                end_to_end: DeliveryTimingStats::default(),
+                cursor_progress_observed_age: DeliveryTimingStats::default(),
+                cursor_stall_observed_age: DeliveryTimingStats::default(),
+                traced_commands: 0,
+                worst_trace: None,
             }
         }
 
@@ -613,6 +715,54 @@ mod relative_mouse {
                 .max(observation.velocity_compensation_permille);
             self.velocity_compensation_limited +=
                 u64::from(observation.velocity_compensation_limited);
+            if let Some(age) = observation.previous_progress_age {
+                self.cursor_progress_observed_age.record(age);
+            }
+            if let Some(age) = observation.previous_stall_age {
+                self.cursor_stall_observed_age.record(age);
+            }
+        }
+
+        fn record_trace(
+            &mut self,
+            trace: MouseTrace,
+            delivery_enqueued_at: Instant,
+            delivery_started_at: Instant,
+            post_elapsed: Duration,
+            stalled_posts: u8,
+        ) {
+            let performer_queue = trace
+                .performer_started_at
+                .saturating_duration_since(trace.input_enqueued_at);
+            let performer_submit = delivery_enqueued_at
+                .saturating_duration_since(trace.performer_started_at);
+            let delivery_queue =
+                delivery_started_at.saturating_duration_since(delivery_enqueued_at);
+            let end_to_end = delivery_started_at.elapsed().saturating_add(
+                delivery_started_at
+                    .saturating_duration_since(trace.input_enqueued_at),
+            );
+            self.performer_queue_age.record(performer_queue);
+            self.performer_submit.record(performer_submit);
+            self.end_to_end.record(end_to_end);
+            self.traced_commands += trace.command_count as u64;
+            let candidate = WorstMouseTrace {
+                first_sequence: trace.first_sequence,
+                last_sequence: trace.last_sequence,
+                command_count: trace.command_count,
+                performer_queue_us: duration_us(performer_queue),
+                performer_submit_us: duration_us(performer_submit),
+                delivery_queue_us: duration_us(delivery_queue),
+                event_post_us: duration_us(post_elapsed),
+                end_to_end_us: duration_us(end_to_end),
+                stalled_posts,
+            };
+            if self
+                .worst_trace
+                .map_or(true, |worst| candidate.end_to_end_us > worst.end_to_end_us)
+            {
+                self.worst_trace = Some(candidate);
+            }
         }
 
         fn maybe_report(
@@ -636,7 +786,7 @@ mod relative_mouse {
             {
                 padjutsu_metrics::metric!(
                     "mouse-delivery",
-                    "[mouse-delivery-metrics] window_ms={} submitted={} posts={} coalesced={} generation_cancelled={} dropped={} button_commands={} queue_len={} mouse_event_post_us({}) mouse_event_post_over_4ms={} mouse_event_post_over_16ms={} mouse_event_post_over_50ms={} delivery_queue_age_us({}) delivery_step_px(n={},avg={},max={}) display_edge_clamped={} stale_cursor_posts={} stale_cursor_sequence_max={} velocity_compensation_x1000(n={},avg={},max={}) velocity_compensation_limited={} mouse_button_post_us({})",
+                    "[mouse-delivery-metrics] window_ms={} submitted={} posts={} coalesced={} generation_cancelled={} dropped={} button_commands={} queue_len={} mouse_event_post_us({}) mouse_event_post_over_4ms={} mouse_event_post_over_16ms={} mouse_event_post_over_50ms={} delivery_queue_age_us({}) performer_queue_age_us({}) performer_submit_us({}) end_to_end_us({}) traced_commands={} cursor_progress_observed_age_us({}) cursor_stall_observed_age_us({}) delivery_step_px(n={},avg={},max={}) display_edge_clamped={} stale_cursor_posts={} stale_cursor_sequence_max={} velocity_compensation_x1000(n={},avg={},max={}) velocity_compensation_limited={} mouse_button_post_us({})",
                     self.started_at.elapsed().as_millis(),
                     submitted,
                     self.post.samples,
@@ -650,6 +800,12 @@ mod relative_mouse {
                     self.post_over_16ms,
                     self.post_over_50ms,
                     self.queue_age.summary(),
+                    self.performer_queue_age.summary(),
+                    self.performer_submit.summary(),
+                    self.end_to_end.summary(),
+                    self.traced_commands,
+                    self.cursor_progress_observed_age.summary(),
+                    self.cursor_stall_observed_age.summary(),
                     self.delivery_step_samples,
                     self.delivery_step_total_px
                         .checked_div(self.delivery_step_samples)
@@ -666,6 +822,34 @@ mod relative_mouse {
                     self.velocity_compensation_limited,
                     self.button_post.summary(),
                 );
+                if let Some(worst) = self.worst_trace {
+                    padjutsu_metrics::metric!(
+                        "mouse-trace",
+                        "[mouse-trace-metrics] worst_sequence={}-{} commands={} performer_queue_us={} performer_submit_us={} delivery_queue_us={} event_post_us={} end_to_end_us={} stalled_posts={}",
+                        worst.first_sequence,
+                        worst.last_sequence,
+                        worst.command_count,
+                        worst.performer_queue_us,
+                        worst.performer_submit_us,
+                        worst.delivery_queue_us,
+                        worst.event_post_us,
+                        worst.end_to_end_us,
+                        worst.stalled_posts,
+                    );
+                }
+                for (index, label) in BUTTON_KIND_LABELS.iter().enumerate() {
+                    if self.button_commands_by_kind[index] == 0 {
+                        continue;
+                    }
+                    padjutsu_metrics::metric!(
+                        "mouse-button",
+                        "[mouse-button-metrics] kind={} commands={} delivery_queue_age_us({}) event_post_us({})",
+                        label,
+                        self.button_commands_by_kind[index],
+                        self.button_queue_age[index].summary(),
+                        self.button_post_by_kind[index].summary(),
+                    );
+                }
             }
             *self = Self::new();
         }
@@ -699,6 +883,8 @@ mod relative_mouse {
         stalled_posts: u8,
         velocity_compensation_permille: u64,
         velocity_compensation_limited: bool,
+        previous_progress_age: Option<Duration>,
+        previous_stall_age: Option<Duration>,
     }
 
     struct VelocityCompensator {
@@ -808,6 +994,8 @@ mod relative_mouse {
             stalled_posts: plan.stalled_posts,
             velocity_compensation_permille,
             velocity_compensation_limited,
+            previous_progress_age: plan.previous_progress_age,
+            previous_stall_age: plan.previous_stall_age,
         })
     }
 
@@ -856,11 +1044,8 @@ mod relative_mouse {
                         .replace(started_at)
                         .map(|last| started_at.saturating_duration_since(last));
                     let (dx, dy, compensation_permille, compensation_limited) =
-                        velocity_compensator.compensate(
-                            command.dx,
-                            command.dy,
-                            elapsed,
-                        );
+                        velocity_compensator
+                            .compensate(command.dx, command.dy, elapsed);
                     let command = MoveCommand { dx, dy, ..command };
                     let queue_age =
                         started_at.saturating_duration_since(command.enqueued_at);
@@ -872,13 +1057,28 @@ mod relative_mouse {
                             compensation_limited,
                         )
                     });
+                    let post_elapsed = started_at.elapsed();
+                    let stalled_posts = observation
+                        .as_ref()
+                        .map_or(0, |observation| observation.stalled_posts);
                     if let Ok(observation) = observation {
                         metrics.record_delivery_step(observation);
                     }
-                    metrics.record_post(queue_age, started_at.elapsed());
+                    if let Some(trace) = command.trace {
+                        metrics.record_trace(
+                            trace,
+                            command.enqueued_at,
+                            started_at,
+                            post_elapsed,
+                            stalled_posts,
+                        );
+                    }
+                    metrics.record_post(queue_age, post_elapsed);
                 }
-                DeliveryMessage::Button(command) => {
+                DeliveryMessage::Button(delivery_command) => {
                     let started_at = Instant::now();
+                    let command = delivery_command.command;
+                    let kind_index = command.kind_index();
                     let _ = super::with_pool(|| match command {
                         ButtonCommand::Click(button, count) => {
                             super::native_mouse::click(button, count)
@@ -891,7 +1091,14 @@ mod relative_mouse {
                         }
                     });
                     metrics.button_commands += 1;
-                    metrics.button_post.record(started_at.elapsed());
+                    metrics.button_commands_by_kind[kind_index] += 1;
+                    metrics.button_queue_age[kind_index]
+                        .record(started_at.saturating_duration_since(
+                            delivery_command.enqueued_at,
+                        ));
+                    let elapsed = started_at.elapsed();
+                    metrics.button_post.record(elapsed);
+                    metrics.button_post_by_kind[kind_index].record(elapsed);
                 }
             }
             metrics.maybe_report(&submitted, &dropped, rx.len(), false);
@@ -908,6 +1115,7 @@ mod relative_mouse {
         delivery: &MouseEventDelivery,
         dx: i32,
         dy: i32,
+        trace: Option<MouseTrace>,
     ) -> InputResult<MouseMoveObservation> {
         let display_epoch = super::display_configuration::epoch();
         let generation = delivery.current_generation();
@@ -921,7 +1129,7 @@ mod relative_mouse {
         // The worker applies this vector from the cursor position that is live
         // at delivery time. Coalescing therefore drops elapsed motion during a
         // WindowServer stall instead of replaying an absolute-position debt.
-        delivery.submit(dx, dy, generation);
+        delivery.submit(dx, dy, generation, trace);
         Ok(MouseMoveObservation {
             x: point.x.round() as i32,
             y: point.y.round() as i32,
@@ -1031,33 +1239,20 @@ mod relative_mouse {
         #[test]
         fn velocity_compensation_adapts_gradually_and_ignores_one_long_stall() {
             let mut compensator = VelocityCompensator::default();
-            assert_eq!(
-                compensator.compensate(20, 10, None),
-                (20, 10, 1_000, false)
-            );
+            assert_eq!(compensator.compensate(20, 10, None), (20, 10, 1_000, false));
 
-            let first_delayed = compensator.compensate(
-                20,
-                10,
-                Some(Duration::from_millis(16)),
-            );
+            let first_delayed =
+                compensator.compensate(20, 10, Some(Duration::from_millis(16)));
             assert_eq!(first_delayed, (21, 10, 1_031, false));
 
             let mut steady = first_delayed;
             for _ in 0..96 {
-                steady = compensator.compensate(
-                    20,
-                    10,
-                    Some(Duration::from_millis(16)),
-                );
+                steady =
+                    compensator.compensate(20, 10, Some(Duration::from_millis(16)));
             }
             assert_eq!(steady, (35, 18, 1_750, true));
             assert_eq!(
-                compensator.compensate(
-                    20,
-                    10,
-                    Some(Duration::from_millis(200)),
-                ),
+                compensator.compensate(20, 10, Some(Duration::from_millis(200)),),
                 steady
             );
         }
@@ -1066,17 +1261,11 @@ mod relative_mouse {
         fn velocity_compensation_preserves_non_diagonal_direction() {
             let mut compensator = VelocityCompensator::default();
             for _ in 0..96 {
-                let _ = compensator.compensate(
-                    22,
-                    11,
-                    Some(Duration::from_millis(16)),
-                );
+                let _ =
+                    compensator.compensate(22, 11, Some(Duration::from_millis(16)));
             }
-            let (dx, dy, _, _) = compensator.compensate(
-                22,
-                11,
-                Some(Duration::from_millis(16)),
-            );
+            let (dx, dy, _, _) =
+                compensator.compensate(22, 11, Some(Duration::from_millis(16)));
 
             assert_eq!((dx, dy), (39, 19));
         }
@@ -1174,6 +1363,12 @@ mod relative_mouse {
             assert_eq!(one_stale.stalled_posts, 1);
             assert_eq!(two_stale.stalled_posts, 2);
             assert_eq!(progressed.stalled_posts, 0);
+            assert_eq!(one_stale.previous_stall_age, Some(Duration::from_millis(8)));
+            assert_eq!(two_stale.previous_stall_age, Some(Duration::from_millis(8)));
+            assert_eq!(
+                progressed.previous_progress_age,
+                Some(Duration::from_millis(8))
+            );
         }
 
         #[test]
@@ -1241,13 +1436,14 @@ mod relative_mouse {
                 dy,
                 generation: 7,
                 enqueued_at: now,
+                trace: None,
             };
             tx.send(DeliveryMessage::Move(command(10, 5))).unwrap();
             tx.send(DeliveryMessage::Move(command(20, 10))).unwrap();
-            tx.send(DeliveryMessage::Button(ButtonCommand::Click(
-                Button::Left,
-                1,
-            )))
+            tx.send(DeliveryMessage::Button(ButtonDeliveryCommand {
+                command: ButtonCommand::Click(Button::Left, 1),
+                enqueued_at: now,
+            }))
             .unwrap();
             tx.send(DeliveryMessage::Move(command(30, 15))).unwrap();
 
@@ -1261,6 +1457,35 @@ mod relative_mouse {
             assert_eq!(coalesced, 1);
             assert!(matches!(pending, Some(DeliveryMessage::Button(_))));
             assert!(matches!(rx.recv().unwrap(), DeliveryMessage::Move(_)));
+        }
+
+        #[test]
+        fn trace_metrics_preserve_every_stage_and_the_worst_sequence() {
+            let now = Instant::now();
+            let trace = MouseTrace {
+                first_sequence: 40,
+                last_sequence: 42,
+                command_count: 3,
+                input_enqueued_at: now - Duration::from_millis(12),
+                performer_started_at: now - Duration::from_millis(8),
+            };
+            let mut metrics = DeliveryMetrics::new();
+            metrics.record_trace(
+                trace,
+                now - Duration::from_millis(6),
+                now - Duration::from_millis(4),
+                Duration::from_millis(4),
+                2,
+            );
+
+            assert_eq!(metrics.performer_queue_age.max_us, 4_000);
+            assert_eq!(metrics.performer_submit.max_us, 2_000);
+            assert_eq!(metrics.traced_commands, 3);
+            let worst = metrics.worst_trace.expect("a trace was recorded");
+            assert_eq!((worst.first_sequence, worst.last_sequence), (40, 42));
+            assert_eq!(worst.delivery_queue_us, 2_000);
+            assert!(worst.end_to_end_us >= 12_000);
+            assert_eq!(worst.stalled_posts, 2);
         }
     }
 }
@@ -1707,7 +1932,7 @@ impl Performer {
     /// Move mouse.
     #[cfg(target_os = "macos")]
     pub fn mouse_move(&mut self, x: i32, y: i32) -> InputResult<()> {
-        self.mouse_move_observed(x, y).map(|_| ())
+        self.mouse_move_observed(x, y, None).map(|_| ())
     }
 
     #[cfg(target_os = "macos")]
@@ -1715,8 +1940,10 @@ impl Performer {
         &mut self,
         x: i32,
         y: i32,
+        trace: Option<MouseTrace>,
     ) -> InputResult<Option<MouseMoveObservation>> {
-        with_pool(|| relative_mouse::post(&self.mouse_delivery, x, y)).map(Some)
+        with_pool(|| relative_mouse::post(&self.mouse_delivery, x, y, trace))
+            .map(Some)
     }
 
     /// Fallback for non-macOS systems.
@@ -1730,6 +1957,7 @@ impl Performer {
         &mut self,
         x: i32,
         y: i32,
+        _trace: Option<MouseTrace>,
     ) -> InputResult<Option<MouseMoveObservation>> {
         self.mouse_move(x, y).map(|_| None)
     }

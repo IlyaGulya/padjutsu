@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use enigo::Button;
 
-use crate::performer::{MouseMoveObservation, Performer};
+use crate::performer::{MouseMoveObservation, MouseTrace, Performer};
 use crate::KeyCombo;
 
 /// Commands sent to the worker thread.
@@ -47,12 +47,94 @@ pub enum PerformerCmd {
     RawModifierRelease(u16),
 }
 
+const COMMAND_KIND_COUNT: usize = 13;
+
+#[derive(Debug, Clone, Copy)]
+enum CommandKind {
+    KeyTap,
+    KeyPress,
+    KeyRelease,
+    MouseMove,
+    ScrollX,
+    ScrollY,
+    TrackpadScroll,
+    MouseClick,
+    MouseDoubleClick,
+    MousePress,
+    MouseRelease,
+    RawModifierPress,
+    RawModifierRelease,
+}
+
+impl CommandKind {
+    const ALL: [Self; COMMAND_KIND_COUNT] = [
+        Self::KeyTap,
+        Self::KeyPress,
+        Self::KeyRelease,
+        Self::MouseMove,
+        Self::ScrollX,
+        Self::ScrollY,
+        Self::TrackpadScroll,
+        Self::MouseClick,
+        Self::MouseDoubleClick,
+        Self::MousePress,
+        Self::MouseRelease,
+        Self::RawModifierPress,
+        Self::RawModifierRelease,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::KeyTap => "key_tap",
+            Self::KeyPress => "key_press",
+            Self::KeyRelease => "key_release",
+            Self::MouseMove => "mouse_move",
+            Self::ScrollX => "scroll_x",
+            Self::ScrollY => "scroll_y",
+            Self::TrackpadScroll => "trackpad_scroll",
+            Self::MouseClick => "mouse_click",
+            Self::MouseDoubleClick => "mouse_double_click",
+            Self::MousePress => "mouse_press",
+            Self::MouseRelease => "mouse_release",
+            Self::RawModifierPress => "raw_modifier_press",
+            Self::RawModifierRelease => "raw_modifier_release",
+        }
+    }
+}
+
+impl PerformerCmd {
+    fn kind(&self) -> CommandKind {
+        match self {
+            Self::KeyTap(_) => CommandKind::KeyTap,
+            Self::KeyPress(_) => CommandKind::KeyPress,
+            Self::KeyRelease(_) => CommandKind::KeyRelease,
+            Self::MouseMove { .. } => CommandKind::MouseMove,
+            Self::ScrollX(_) => CommandKind::ScrollX,
+            Self::ScrollY(_) => CommandKind::ScrollY,
+            Self::TrackpadScroll { .. } => CommandKind::TrackpadScroll,
+            Self::MouseClick(_) => CommandKind::MouseClick,
+            Self::MouseDoubleClick(_) => CommandKind::MouseDoubleClick,
+            Self::MousePress(_) => CommandKind::MousePress,
+            Self::MouseRelease(_) => CommandKind::MouseRelease,
+            #[cfg(target_os = "macos")]
+            Self::RawModifierPress(_) => CommandKind::RawModifierPress,
+            #[cfg(target_os = "macos")]
+            Self::RawModifierRelease(_) => CommandKind::RawModifierRelease,
+        }
+    }
+}
+
 /// Handle to the worker thread. Drop to terminate the worker.
 pub struct PerformerWorker {
     tx: Sender<QueuedCmd>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     mouse_generation: Arc<AtomicU64>,
+    next_sequence: AtomicU64,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -81,6 +163,7 @@ impl PerformerWorker {
             stop,
             dropped,
             mouse_generation,
+            next_sequence: AtomicU64::new(1),
             join: Some(join),
         }
     }
@@ -97,6 +180,7 @@ impl PerformerWorker {
             cmd,
             enqueued_at: Instant::now(),
             mouse_generation: self.mouse_generation.load(Ordering::Acquire),
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
         };
         match self.tx.try_send(queued) {
             Ok(()) => Ok(()),
@@ -125,6 +209,7 @@ impl Drop for PerformerWorker {
             cmd: PerformerCmd::MouseMove { dx: 0, dy: 0 },
             enqueued_at: Instant::now(),
             mouse_generation: self.mouse_generation.load(Ordering::Acquire),
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
         });
         if let Some(j) = self.join.take() {
             let _ = j.join();
@@ -137,6 +222,7 @@ struct QueuedCmd {
     cmd: PerformerCmd,
     enqueued_at: Instant,
     mouse_generation: u64,
+    sequence: u64,
 }
 
 const MAX_CATCH_UP_DELTA_PX: f64 = 32.0;
@@ -210,9 +296,17 @@ fn execute_batch(
                 let mut sum_dx: i32 = 0;
                 let mut sum_dy: i32 = 0;
                 let mut valid_commands = 0_usize;
+                let mut first_sequence = 0;
+                let mut last_sequence = 0;
+                let mut first_enqueued_at = None;
                 while i < batch.len() {
                     if let PerformerCmd::MouseMove { dx, dy } = batch[i].cmd {
                         if batch[i].mouse_generation == current_generation {
+                            if valid_commands == 0 {
+                                first_sequence = batch[i].sequence;
+                                first_enqueued_at = Some(batch[i].enqueued_at);
+                            }
+                            last_sequence = batch[i].sequence;
                             sum_dx = sum_dx.saturating_add(dx);
                             sum_dy = sum_dy.saturating_add(dy);
                             valid_commands += 1;
@@ -238,17 +332,33 @@ fn execute_batch(
                 );
                 if valid_commands > 0 && (sum_dx != 0 || sum_dy != 0) {
                     let started_at = metrics.start_execution();
-                    let observation =
-                        performer.mouse_move_observed(sum_dx, sum_dy).ok().flatten();
+                    let performer_started_at =
+                        started_at.unwrap_or_else(Instant::now);
+                    let trace = MouseTrace {
+                        first_sequence,
+                        last_sequence,
+                        command_count: valid_commands,
+                        input_enqueued_at: first_enqueued_at
+                            .unwrap_or(batch[segment_start].enqueued_at),
+                        performer_started_at,
+                    };
+                    let observation = performer
+                        .mouse_move_observed(sum_dx, sum_dy, Some(trace))
+                        .ok()
+                        .flatten();
+                    let elapsed =
+                        metrics.record_execution(ExecutionKind::Mouse, started_at);
+                    metrics
+                        .record_command_execution(CommandKind::MouseMove, elapsed);
                     metrics.record_mouse(
                         sum_dx,
                         sum_dy,
                         valid_commands,
-                        batch[segment_start].enqueued_at,
+                        first_enqueued_at
+                            .unwrap_or(batch[segment_start].enqueued_at),
                         started_at,
                         observation,
                     );
-                    metrics.record_execution(ExecutionKind::Mouse, started_at);
                 }
                 metrics.record_coalesced(segment_commands.saturating_sub(1));
             }
@@ -266,7 +376,9 @@ fn execute_batch(
                 if sum != 0.0 {
                     let started_at = metrics.start_execution();
                     let _ = performer.scroll_x(sum);
-                    metrics.record_execution(ExecutionKind::Scroll, started_at);
+                    let elapsed =
+                        metrics.record_execution(ExecutionKind::Scroll, started_at);
+                    metrics.record_command_execution(CommandKind::ScrollX, elapsed);
                 }
                 metrics.record_coalesced(i - segment_start - 1);
             }
@@ -284,7 +396,9 @@ fn execute_batch(
                 if sum != 0.0 {
                     let started_at = metrics.start_execution();
                     let _ = performer.scroll_y(sum);
-                    metrics.record_execution(ExecutionKind::Scroll, started_at);
+                    let elapsed =
+                        metrics.record_execution(ExecutionKind::Scroll, started_at);
+                    metrics.record_command_execution(CommandKind::ScrollY, elapsed);
                 }
                 metrics.record_coalesced(i - segment_start - 1);
             }
@@ -318,15 +432,23 @@ fn execute_batch(
                 if horizontal != 0.0 || vertical != 0.0 {
                     let started_at = metrics.start_execution();
                     let _ = performer.trackpad_scroll(horizontal, vertical, *zoom);
-                    metrics.record_execution(ExecutionKind::Scroll, started_at);
+                    let elapsed =
+                        metrics.record_execution(ExecutionKind::Scroll, started_at);
+                    metrics.record_command_execution(
+                        CommandKind::TrackpadScroll,
+                        elapsed,
+                    );
                 }
                 metrics.record_coalesced(i - segment_start - 1);
             }
             // Non-coalescing commands: execute one at a time.
             other => {
                 let started_at = metrics.start_execution();
+                let kind = other.kind();
                 execute_one(performer, other);
-                metrics.record_execution(ExecutionKind::Other, started_at);
+                let elapsed =
+                    metrics.record_execution(ExecutionKind::Other, started_at);
+                metrics.record_command_execution(kind, elapsed);
                 i += 1;
             }
         }
@@ -558,6 +680,14 @@ struct WorkerMetrics {
     last_display_epoch: Option<u64>,
     scroll_post: TimingStats,
     other_execution: TimingStats,
+    command_enqueued: [u64; COMMAND_KIND_COUNT],
+    command_executions: [u64; COMMAND_KIND_COUNT],
+    command_queue_wait: [TimingStats; COMMAND_KIND_COUNT],
+    command_execution: [TimingStats; COMMAND_KIND_COUNT],
+    command_queue_over_4ms: [u64; COMMAND_KIND_COUNT],
+    command_queue_over_16ms: [u64; COMMAND_KIND_COUNT],
+    command_execution_over_4ms: [u64; COMMAND_KIND_COUNT],
+    command_execution_over_16ms: [u64; COMMAND_KIND_COUNT],
 }
 
 impl WorkerMetrics {
@@ -609,6 +739,14 @@ impl WorkerMetrics {
             last_display_epoch: None,
             scroll_post: TimingStats::default(),
             other_execution: TimingStats::default(),
+            command_enqueued: [0; COMMAND_KIND_COUNT],
+            command_executions: [0; COMMAND_KIND_COUNT],
+            command_queue_wait: std::array::from_fn(|_| TimingStats::default()),
+            command_execution: std::array::from_fn(|_| TimingStats::default()),
+            command_queue_over_4ms: [0; COMMAND_KIND_COUNT],
+            command_queue_over_16ms: [0; COMMAND_KIND_COUNT],
+            command_execution_over_4ms: [0; COMMAND_KIND_COUNT],
+            command_execution_over_16ms: [0; COMMAND_KIND_COUNT],
         }
     }
 
@@ -622,6 +760,13 @@ impl WorkerMetrics {
         let now = Instant::now();
         for queued in batch {
             let wait = now.saturating_duration_since(queued.enqueued_at);
+            let kind_index = queued.cmd.kind().index();
+            self.command_enqueued[kind_index] += 1;
+            self.command_queue_wait[kind_index].record(wait);
+            self.command_queue_over_4ms[kind_index] +=
+                u64::from(wait > Duration::from_millis(4));
+            self.command_queue_over_16ms[kind_index] +=
+                u64::from(wait > Duration::from_millis(16));
             self.queue_wait.record(wait);
             self.queue_wait_over_4ms += u64::from(wait > Duration::from_millis(4));
             self.queue_wait_over_16ms += u64::from(wait > Duration::from_millis(16));
@@ -636,10 +781,8 @@ impl WorkerMetrics {
         &mut self,
         kind: ExecutionKind,
         started_at: Option<Instant>,
-    ) {
-        let Some(started_at) = started_at else {
-            return;
-        };
+    ) -> Option<Duration> {
+        let started_at = started_at?;
         self.executions += 1;
         let elapsed = started_at.elapsed();
         match kind {
@@ -655,6 +798,24 @@ impl WorkerMetrics {
             ExecutionKind::Scroll => self.scroll_post.record(elapsed),
             ExecutionKind::Other => self.other_execution.record(elapsed),
         }
+        Some(elapsed)
+    }
+
+    fn record_command_execution(
+        &mut self,
+        kind: CommandKind,
+        elapsed: Option<Duration>,
+    ) {
+        let Some(elapsed) = elapsed else {
+            return;
+        };
+        let index = kind.index();
+        self.command_executions[index] += 1;
+        self.command_execution[index].record(elapsed);
+        self.command_execution_over_4ms[index] +=
+            u64::from(elapsed > Duration::from_millis(4));
+        self.command_execution_over_16ms[index] +=
+            u64::from(elapsed > Duration::from_millis(16));
     }
 
     fn record_mouse(
@@ -830,6 +991,27 @@ impl WorkerMetrics {
             self.scroll_post.summary(),
             self.other_execution.summary(),
         );
+        for kind in CommandKind::ALL {
+            let index = kind.index();
+            if self.command_enqueued[index] == 0
+                && self.command_executions[index] == 0
+            {
+                continue;
+            }
+            padjutsu_metrics::metric!(
+                "performer-command",
+                "[performer-command-metrics] kind={} enqueued={} executions={} queue_wait_us({}) queue_over_4ms={} queue_over_16ms={} execution_us({}) execution_over_4ms={} execution_over_16ms={}",
+                kind.label(),
+                self.command_enqueued[index],
+                self.command_executions[index],
+                self.command_queue_wait[index].summary(),
+                self.command_queue_over_4ms[index],
+                self.command_queue_over_16ms[index],
+                self.command_execution[index].summary(),
+                self.command_execution_over_4ms[index],
+                self.command_execution_over_16ms[index],
+            );
+        }
         let dropped = self.dropped.clone();
         let last_mouse_post_at = self.last_mouse_post_at;
         let last_mouse_delta = self.last_mouse_delta;
@@ -919,8 +1101,17 @@ fn set_realtime_priority_2ms() {
     };
     if kr == KERN_SUCCESS {
         eprintln!("[performer-worker] realtime priority set");
+        padjutsu_metrics::metric!(
+            "thread-policy",
+            "[thread-policy-metrics] name=performer-worker requested=time_constraint result=success"
+        );
     } else {
         eprintln!("[performer-worker] failed to set RT priority: {kr}");
+        padjutsu_metrics::metric!(
+            "thread-policy",
+            "[thread-policy-metrics] name=performer-worker requested=time_constraint result=failure kern_return={}",
+            kr
+        );
     }
 }
 
@@ -936,6 +1127,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicU64::new(0)),
             mouse_generation: Arc::new(AtomicU64::new(0)),
+            next_sequence: AtomicU64::new(1),
             join: None,
         };
 
