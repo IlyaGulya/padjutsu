@@ -148,6 +148,9 @@ mod relative_mouse {
     const RESYNC_AFTER_IDLE: Duration = Duration::from_millis(50);
     const DISPLAY_EDGE_EPSILON_PX: f64 = 0.001;
     const DELIVERY_QUEUE_CAPACITY: usize = 1024;
+    const NOMINAL_MOUSE_TICK_US: f64 = 8_000.0;
+    const MAX_VELOCITY_COMPENSATION: f64 = 2.25;
+    const MAX_COMPENSATED_VECTOR_PX: f64 = 52.0;
 
     #[derive(Debug, Clone, Copy)]
     struct MoveCommand {
@@ -547,6 +550,10 @@ mod relative_mouse {
         delivery_step_limited: u64,
         stale_cursor_posts: u64,
         stale_cursor_sequence_max: u8,
+        velocity_compensation_samples: u64,
+        velocity_compensation_total_permille: u64,
+        velocity_compensation_max_permille: u64,
+        velocity_compensation_limited: u64,
         post_over_4ms: u64,
         post_over_16ms: u64,
         post_over_50ms: u64,
@@ -568,6 +575,10 @@ mod relative_mouse {
                 delivery_step_limited: 0,
                 stale_cursor_posts: 0,
                 stale_cursor_sequence_max: 0,
+                velocity_compensation_samples: 0,
+                velocity_compensation_total_permille: 0,
+                velocity_compensation_max_permille: 0,
+                velocity_compensation_limited: 0,
                 post_over_4ms: 0,
                 post_over_16ms: 0,
                 post_over_50ms: 0,
@@ -592,6 +603,14 @@ mod relative_mouse {
             self.stale_cursor_sequence_max = self
                 .stale_cursor_sequence_max
                 .max(observation.stalled_posts);
+            self.velocity_compensation_samples += 1;
+            self.velocity_compensation_total_permille +=
+                observation.velocity_compensation_permille;
+            self.velocity_compensation_max_permille = self
+                .velocity_compensation_max_permille
+                .max(observation.velocity_compensation_permille);
+            self.velocity_compensation_limited +=
+                u64::from(observation.velocity_compensation_limited);
         }
 
         fn maybe_report(
@@ -615,7 +634,7 @@ mod relative_mouse {
             {
                 padjutsu_metrics::metric!(
                     "mouse-delivery",
-                    "[mouse-delivery-metrics] window_ms={} submitted={} posts={} coalesced={} generation_cancelled={} dropped={} button_commands={} queue_len={} mouse_event_post_us({}) mouse_event_post_over_4ms={} mouse_event_post_over_16ms={} mouse_event_post_over_50ms={} delivery_queue_age_us({}) delivery_step_px(n={},avg={},max={}) display_edge_clamped={} stale_cursor_posts={} stale_cursor_sequence_max={} mouse_button_post_us({})",
+                    "[mouse-delivery-metrics] window_ms={} submitted={} posts={} coalesced={} generation_cancelled={} dropped={} button_commands={} queue_len={} mouse_event_post_us({}) mouse_event_post_over_4ms={} mouse_event_post_over_16ms={} mouse_event_post_over_50ms={} delivery_queue_age_us({}) delivery_step_px(n={},avg={},max={}) display_edge_clamped={} stale_cursor_posts={} stale_cursor_sequence_max={} velocity_compensation_x1000(n={},avg={},max={}) velocity_compensation_limited={} mouse_button_post_us({})",
                     self.started_at.elapsed().as_millis(),
                     submitted,
                     self.post.samples,
@@ -637,6 +656,12 @@ mod relative_mouse {
                     self.delivery_step_limited,
                     self.stale_cursor_posts,
                     self.stale_cursor_sequence_max,
+                    self.velocity_compensation_samples,
+                    self.velocity_compensation_total_permille
+                        .checked_div(self.velocity_compensation_samples)
+                        .unwrap_or(0),
+                    self.velocity_compensation_max_permille,
+                    self.velocity_compensation_limited,
                     self.button_post.summary(),
                 );
             }
@@ -670,11 +695,43 @@ mod relative_mouse {
         step_axis_px: u64,
         step_limited: bool,
         stalled_posts: u8,
+        velocity_compensation_permille: u64,
+        velocity_compensation_limited: bool,
+    }
+
+    fn compensate_velocity(
+        dx: i32,
+        dy: i32,
+        elapsed: Option<Duration>,
+    ) -> (i32, i32, u64, bool) {
+        let requested_scale = elapsed
+            .map(|elapsed| elapsed.as_micros() as f64 / NOMINAL_MOUSE_TICK_US)
+            .unwrap_or(1.0)
+            .max(1.0);
+        let scale = requested_scale.min(MAX_VELOCITY_COMPENSATION);
+        let mut scaled_x = f64::from(dx) * scale;
+        let mut scaled_y = f64::from(dy) * scale;
+        let length = scaled_x.hypot(scaled_y);
+        let mut limited = requested_scale > MAX_VELOCITY_COMPENSATION;
+        if length > MAX_COMPENSATED_VECTOR_PX {
+            let vector_scale = MAX_COMPENSATED_VECTOR_PX / length;
+            scaled_x *= vector_scale;
+            scaled_y *= vector_scale;
+            limited = true;
+        }
+        (
+            scaled_x.round() as i32,
+            scaled_y.round() as i32,
+            (scale * 1_000.0).round() as u64,
+            limited,
+        )
     }
 
     fn post_movement_event(
         tracker: &mut TargetTracker,
         command: MoveCommand,
+        velocity_compensation_permille: u64,
+        velocity_compensation_limited: bool,
     ) -> Result<MovementPost, ()> {
         let pressed = unsafe { NSEvent::pressedMouseButtons() };
         let (event_type, button) = if pressed & 1 > 0 {
@@ -724,6 +781,8 @@ mod relative_mouse {
                     || plan.destination.y != requested.y
             },
             stalled_posts: plan.stalled_posts,
+            velocity_compensation_permille,
+            velocity_compensation_limited,
         })
     }
 
@@ -736,6 +795,8 @@ mod relative_mouse {
     ) {
         let mut metrics = DeliveryMetrics::new();
         let mut tracker = TargetTracker::default();
+        let mut delivery_generation = None;
+        let mut last_move_started_at = None;
         let mut pending = None;
         while !stop.load(Ordering::Acquire) {
             let message = match pending.take() {
@@ -758,12 +819,27 @@ mod relative_mouse {
                         metrics.generation_cancelled += 1;
                         continue;
                     }
+                    if delivery_generation != Some(command.generation) {
+                        delivery_generation = Some(command.generation);
+                        last_move_started_at = None;
+                    }
                     tracker.reset_if_generation_changed(command.generation);
                     let started_at = Instant::now();
+                    let elapsed = last_move_started_at
+                        .replace(started_at)
+                        .map(|last| started_at.saturating_duration_since(last));
+                    let (dx, dy, compensation_permille, compensation_limited) =
+                        compensate_velocity(command.dx, command.dy, elapsed);
+                    let command = MoveCommand { dx, dy, ..command };
                     let queue_age =
                         started_at.saturating_duration_since(command.enqueued_at);
                     let observation = super::with_pool(|| {
-                        post_movement_event(&mut tracker, command)
+                        post_movement_event(
+                            &mut tracker,
+                            command,
+                            compensation_permille,
+                            compensation_limited,
+                        )
                     });
                     if let Ok(observation) = observation {
                         metrics.record_delivery_step(observation);
@@ -919,6 +995,27 @@ mod relative_mouse {
 
             assert_eq!(plan.destination.x - actual.x, 22.0);
             assert_eq!(plan.destination.y - actual.y, 11.0);
+        }
+
+        #[test]
+        fn delayed_frames_compensate_velocity_without_building_unbounded_debt() {
+            assert_eq!(compensate_velocity(20, 10, None), (20, 10, 1_000, false));
+            assert_eq!(
+                compensate_velocity(20, 10, Some(Duration::from_millis(16))),
+                (40, 20, 2_000, false)
+            );
+            assert_eq!(
+                compensate_velocity(20, 10, Some(Duration::from_millis(200))),
+                (45, 23, 2_250, true)
+            );
+        }
+
+        #[test]
+        fn velocity_compensation_preserves_non_diagonal_direction() {
+            let (dx, dy, _, _) =
+                compensate_velocity(22, 11, Some(Duration::from_millis(16)));
+
+            assert_eq!((dx, dy), (44, 22));
         }
 
         #[test]
