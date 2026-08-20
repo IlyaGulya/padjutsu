@@ -7,7 +7,8 @@ use colored::Colorize;
 use padjutsu_control::KeyCombo;
 use padjutsu_bit_mask::Bitmask;
 use padjutsu_gamepad::{
-    Axis as CtrlAxis, AxisSnapshot, Button, ControllerId, ControllerInfo,
+    Axis as CtrlAxis, AxisSnapshot, Button, ButtonSnapshot, ControllerId,
+    ControllerInfo,
 };
 use padjutsu_workspace::{
     ButtonAction, ControllerSettings, Profile, StickMode, StickSide,
@@ -45,7 +46,7 @@ struct ButtonRepeatPoll {
 
 #[derive(Debug, Clone)]
 struct ButtonTransition {
-    target_button: Button,
+    target: Bitmask<Button>,
     effects: Vec<Effect>,
     repeat: ButtonRepeatDirective,
 }
@@ -68,7 +69,7 @@ pub struct Padjutsu {
     controllers: AHashMap<ControllerId, ControllerState>,
     sticks: RefCell<StickProcessor>,
     axes_scratch: Vec<(ControllerId, [f32; 6])>,
-    button_repeats: AHashMap<(ControllerId, Button), ButtonRepeatTask>,
+    button_repeats: AHashMap<(ControllerId, Bitmask<Button>), ButtonRepeatTask>,
 }
 
 impl Default for Padjutsu {
@@ -249,6 +250,30 @@ impl Padjutsu {
         }
         state.axes = axes;
         true
+    }
+
+    /// Cancel repeat tasks whose physical release is already visible in the
+    /// authoritative SDL snapshot but is still waiting in the event queue.
+    pub fn sync_button_repeat_snapshot(
+        &mut self,
+        id: ControllerId,
+        snapshot: ButtonSnapshot,
+    ) -> u64 {
+        let Some(state) = self.controllers.get(&id) else {
+            return 0;
+        };
+        let mut mapped_pressed = Bitmask::empty();
+        for raw in Button::ALL {
+            if snapshot[raw.index()] {
+                mapped_pressed
+                    .insert(*state.mapping.mapping.get(&raw).unwrap_or(&raw));
+            }
+        }
+        let before = self.button_repeats.len();
+        self.button_repeats.retain(|(controller, target), _| {
+            *controller != id || mapped_pressed.is_superset(target)
+        });
+        before.saturating_sub(self.button_repeats.len()) as u64
     }
 
     pub fn has_active_mouse_axis_input(&self) -> bool {
@@ -632,7 +657,7 @@ impl Padjutsu {
         now_pressed: Bitmask<Button>,
         phase: ButtonPhase,
         id: ControllerId,
-        button: Button,
+        _button: Button,
         rumble: bool,
     ) -> Vec<ButtonTransition> {
         let mut transitions = Vec::new();
@@ -663,7 +688,7 @@ impl Padjutsu {
                     _ => ButtonRepeatDirective::None,
                 };
                 transitions.push(ButtonTransition {
-                    target_button: button,
+                    target: *target,
                     effects,
                     repeat,
                 });
@@ -750,7 +775,7 @@ impl Padjutsu {
                         }
                     };
                     transitions.push(ButtonTransition {
-                        target_button: button,
+                        target: *target,
                         effects,
                         repeat,
                     });
@@ -780,7 +805,7 @@ impl Padjutsu {
                 interval_ms,
             } => {
                 self.button_repeats.insert(
-                    (id, transition.target_button),
+                    (id, transition.target),
                     ButtonRepeatTask {
                         key,
                         interval_ms,
@@ -791,7 +816,7 @@ impl Padjutsu {
                 );
             }
             ButtonRepeatDirective::Stop => {
-                self.button_repeats.remove(&(id, transition.target_button));
+                self.button_repeats.remove(&(id, transition.target));
             }
         }
     }
@@ -839,6 +864,10 @@ impl Padjutsu {
 #[cfg(test)]
 mod axis_snapshot_tests {
     use super::*;
+    use std::sync::Arc;
+
+    use padjutsu_control::{Key, KeyCombo};
+    use padjutsu_workspace::{ButtonAction, ButtonRule};
 
     fn controller_info(id: ControllerId) -> ControllerInfo {
         ControllerInfo {
@@ -868,5 +897,70 @@ mod axis_snapshot_tests {
             0.05
         ));
         assert!(!padjutsu.sync_axis_snapshot(7, [0.0; CtrlAxis::ALL.len()]));
+    }
+
+    #[test]
+    fn authoritative_release_cancels_repeat_before_queued_release_arrives() {
+        let mut padjutsu = Padjutsu::new();
+        padjutsu.add_controller(controller_info(7));
+        padjutsu.button_repeats.insert(
+            (7, Bitmask::new(&[Button::A])),
+            ButtonRepeatTask {
+                key: KeyCombo::from_key(Key::Unicode('a')),
+                interval_ms: 50,
+                next_fire: Instant::now(),
+                delay_done: false,
+            },
+        );
+
+        let cancelled =
+            padjutsu.sync_button_repeat_snapshot(7, [false; Button::ALL.len()]);
+
+        assert_eq!(cancelled, 1);
+        assert!(padjutsu.button_repeats.is_empty());
+        assert!(padjutsu.button_repeat_effects(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn chord_repeat_uses_same_binding_key_on_press_and_release() {
+        let target = Bitmask::new(&[Button::LeftTrigger, Button::A]);
+        let mut rules = padjutsu_workspace::ButtonRules::new();
+        rules.insert(
+            target,
+            ButtonRule {
+                action: ButtonAction::Keystroke(Arc::new(KeyCombo::from_key(
+                    Key::Unicode('a'),
+                ))),
+                vibrate: None,
+                repeat_delay_ms: Some(400),
+                repeat_interval_ms: Some(50),
+            },
+        );
+        let press = Padjutsu::resolve_button_transitions(
+            &rules,
+            Bitmask::new(&[Button::LeftTrigger]),
+            target,
+            ButtonPhase::Pressed,
+            7,
+            Button::A,
+            false,
+        );
+        let release = Padjutsu::resolve_button_transitions(
+            &rules,
+            target,
+            Bitmask::new(&[Button::A]),
+            ButtonPhase::Released,
+            7,
+            Button::LeftTrigger,
+            false,
+        );
+
+        assert_eq!(press[0].target, target);
+        assert_eq!(release[0].target, target);
+        assert!(matches!(
+            press[0].repeat,
+            ButtonRepeatDirective::Start { .. }
+        ));
+        assert!(matches!(release[0].repeat, ButtonRepeatDirective::Stop));
     }
 }

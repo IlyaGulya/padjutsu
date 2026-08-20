@@ -9,13 +9,14 @@ use crate::Result;
 use crate::events::{ControllerEvent, EventReceiver};
 use crate::handle::ControllerHandle;
 use crate::runtime::start_runtime_thread;
-use crate::types::{AxisSnapshot, ControllerId, ControllerInfo};
+use crate::types::{AxisSnapshot, ButtonSnapshot, ControllerId, ControllerInfo};
 
 /// Shared state used by the manager, the runtime loop and controller handles.
 pub(crate) struct Inner {
     pub subscribers: Mutex<Vec<Sender<ControllerEvent>>>,
     pub controllers_info: RwLock<AHashMap<ControllerId, ControllerInfo>>,
     pub controller_axes: RwLock<AHashMap<ControllerId, AxisSnapshot>>,
+    pub controller_buttons: RwLock<AHashMap<ControllerId, ButtonSnapshot>>,
     pub cmd_tx: Sender<Command>,
 }
 
@@ -33,6 +34,7 @@ impl ControllerManager {
             subscribers: Mutex::new(Vec::new()),
             controllers_info: RwLock::new(AHashMap::new()),
             controller_axes: RwLock::new(AHashMap::new()),
+            controller_buttons: RwLock::new(AHashMap::new()),
             cmd_tx,
         });
 
@@ -86,6 +88,18 @@ impl ControllerManager {
         if let Ok(map) = self.inner.controller_axes.read() {
             for (id, axes) in map.iter() {
                 visitor(*id, *axes);
+            }
+        }
+    }
+
+    /// Visits authoritative button state without waiting for queued events.
+    pub fn for_each_button_snapshot(
+        &self,
+        mut visitor: impl FnMut(ControllerId, ButtonSnapshot),
+    ) {
+        if let Ok(map) = self.inner.controller_buttons.read() {
+            for (id, buttons) in map.iter() {
+                visitor(*id, *buttons);
             }
         }
     }

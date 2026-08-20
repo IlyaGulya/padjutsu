@@ -196,6 +196,9 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     if value_after(line, "display_reconfiguration_events=") > 0 {
         return Some("display-reconfiguration");
     }
+    if value_after(line, "button_repeat_snapshot_cancellations=") > 0 {
+        return Some("stale-button-repeat-cancelled");
+    }
     if value_after(line, "subscriber_drops=") > 0
         || value_after(line, " dropped=") > 0
     {
@@ -206,6 +209,9 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     {
         return Some("windowserver-cursor-warp-stall");
     }
+    if max_in_summary(line, "mouse_button_post_us(") > 16_000 {
+        return Some("windowserver-button-post-stall");
+    }
     if value_after(line, "mouse_event_post_over_16ms=") > 0
         || value_after(line, "mouse_event_post_over_50ms=") > 0
         || value_after(line, "mouse_post_over_16ms=") > 0
@@ -215,6 +221,9 @@ pub fn classify_incident(line: &str) -> Option<&'static str> {
     }
     if value_after(line, "queue_wait_over_4ms=") > 0 {
         return Some("performer-queue-stall");
+    }
+    if value_after(line, "mouse_prediction_clamped=") > 0 {
+        return Some("cursor-prediction-clamped");
     }
     if (line.contains("[wake-metrics]") && value_after(line, "over_4ms=") > 0)
         || value_after(line, "missed_periods=") > 0
@@ -462,8 +471,18 @@ mod tests {
             Some("metrics-recorder-overflow")
         );
         assert_eq!(
+            classify_incident(
+                "button_repeat_snapshot_cancellations=1 axis_snapshot_corrections=0"
+            ),
+            Some("stale-button-repeat-cancelled")
+        );
+        assert_eq!(
             classify_incident("mouse_warp_over_16ms=2 mouse_warp_over_50ms=0"),
             Some("windowserver-cursor-warp-stall")
+        );
+        assert_eq!(
+            classify_incident("mouse_button_post_us(n=3,avg=9000,max=17000)"),
+            Some("windowserver-button-post-stall")
         );
         assert_eq!(
             classify_incident(
@@ -474,6 +493,10 @@ mod tests {
         assert_eq!(
             classify_incident("mouse_post_over_16ms=2 mouse_post_over_50ms=0"),
             Some("windowserver-event-post-stall")
+        );
+        assert_eq!(
+            classify_incident("mouse_prediction_clamped=9 cursor_stalled=4"),
+            Some("cursor-prediction-clamped")
         );
         assert_eq!(
             classify_incident("[wake-metrics] over_4ms=3 missed_periods=0"),

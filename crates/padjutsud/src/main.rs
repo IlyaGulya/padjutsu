@@ -349,6 +349,8 @@ fn process_overdue_wake(
     let mouse_was_active = padjutsu.has_active_mouse_axis_input();
     let corrections = sync_latest_controller_axes(padjutsu, manager);
     wake_state.record_axis_snapshot_corrections(corrections);
+    let cancellations = sync_latest_button_repeats(padjutsu, manager);
+    wake_state.record_button_repeat_snapshot_cancellations(cancellations);
     if mouse_was_active && !padjutsu.has_active_mouse_axis_input() {
         action_runner.cancel_mouse_motion();
     }
@@ -375,6 +377,8 @@ fn dispatch_domain_event(
     if matches!(&event, DomainEvent::Timer(TimerEvent::Wake)) {
         let corrections = sync_latest_controller_axes(padjutsu, manager);
         wake_state.record_axis_snapshot_corrections(corrections);
+        let cancellations = sync_latest_button_repeats(padjutsu, manager);
+        wake_state.record_button_repeat_snapshot_cancellations(cancellations);
         wake_state.record_timer_wake(std::time::Instant::now());
     }
     let step = reduce_event(event, padjutsu, manager, runtime_state, wake_state);
@@ -398,6 +402,22 @@ fn sync_latest_controller_axes(
         );
     }
     corrections
+}
+
+fn sync_latest_button_repeats(
+    padjutsu: &mut Padjutsu,
+    manager: &ControllerManager,
+) -> u64 {
+    let mut cancellations = 0_u64;
+    manager.for_each_button_snapshot(|id, buttons| {
+        cancellations += padjutsu.sync_button_repeat_snapshot(id, buttons);
+    });
+    if cancellations > 0 {
+        print_debug!(
+            "latest-button snapshot cancelled {cancellations} stale repeats"
+        );
+    }
+    cancellations
 }
 
 fn dispatch_and_process_overdue(

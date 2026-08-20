@@ -623,6 +623,27 @@ fn broadcast(inner: &Inner, event: ControllerEvent) {
             | ControllerEvent::ButtonReleased { .. } => {}
         }
     }
+    if let Ok(mut snapshots) = inner.controller_buttons.write() {
+        match &event {
+            ControllerEvent::Connected(info) => {
+                snapshots
+                    .entry(info.id)
+                    .or_insert([false; Button::ALL.len()]);
+            }
+            ControllerEvent::Disconnected(id) => {
+                snapshots.remove(id);
+            }
+            ControllerEvent::ButtonPressed { id, button } => {
+                snapshots.entry(*id).or_insert([false; Button::ALL.len()])
+                    [button.index()] = true;
+            }
+            ControllerEvent::ButtonReleased { id, button } => {
+                snapshots.entry(*id).or_insert([false; Button::ALL.len()])
+                    [button.index()] = false;
+            }
+            ControllerEvent::AxisMotion { .. } => {}
+        }
+    }
     if crate::metrics::is_enabled() {
         METRICS.with(|m| {
             let mut m = m.borrow_mut();
@@ -688,6 +709,7 @@ mod tests {
             subscribers: Mutex::new(vec![subscriber_tx]),
             controllers_info: RwLock::new(AHashMap::new()),
             controller_axes: RwLock::new(AHashMap::new()),
+            controller_buttons: RwLock::new(AHashMap::new()),
             cmd_tx,
         };
 
@@ -702,5 +724,36 @@ mod tests {
 
         let snapshots = inner.controller_axes.read().unwrap();
         assert_eq!(snapshots[&7][Axis::LeftX.index()], 0.75);
+    }
+
+    #[test]
+    fn latest_button_snapshot_bypasses_a_full_subscriber_queue() {
+        let (cmd_tx, _cmd_rx) = unbounded();
+        let (subscriber_tx, _subscriber_rx) = bounded(0);
+        let inner = Inner {
+            subscribers: Mutex::new(vec![subscriber_tx]),
+            controllers_info: RwLock::new(AHashMap::new()),
+            controller_axes: RwLock::new(AHashMap::new()),
+            controller_buttons: RwLock::new(AHashMap::new()),
+            cmd_tx,
+        };
+
+        broadcast(
+            &inner,
+            ControllerEvent::ButtonPressed {
+                id: 7,
+                button: Button::A,
+            },
+        );
+        broadcast(
+            &inner,
+            ControllerEvent::ButtonReleased {
+                id: 7,
+                button: Button::A,
+            },
+        );
+
+        let snapshots = inner.controller_buttons.read().unwrap();
+        assert!(!snapshots[&7][Button::A.index()]);
     }
 }

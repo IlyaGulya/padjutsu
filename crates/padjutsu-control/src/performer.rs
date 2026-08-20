@@ -12,6 +12,7 @@ pub(crate) struct MouseMoveObservation {
     pub(crate) y: i32,
     pub(crate) posted_dx: i32,
     pub(crate) posted_dy: i32,
+    pub(crate) prediction_clamped: bool,
     pub(crate) recovery_warped: bool,
     pub(crate) visual_warp_attempted: bool,
     pub(crate) visual_warped: bool,
@@ -139,18 +140,15 @@ mod relative_mouse {
             EventField,
         },
     };
-    use enigo::{InputError, InputResult};
+    use enigo::{Button, InputError, InputResult};
     use objc2_app_kit::NSEvent;
 
     use super::MouseMoveObservation;
 
-    const MAX_PREDICTED_LEAD_PX: f64 = 32.0;
+    const MAX_DELIVERY_STEP_PX: f64 = 24.0;
     const RESYNC_AFTER_IDLE: Duration = Duration::from_millis(50);
-    // A stale position already confirms that the previous 8ms-tick event was
-    // accepted but not applied. Recover immediately instead of waiting for a
-    // second lost movement.
-    const RECOVER_AFTER_STALLED_POSTS: u8 = 1;
-    const DELIVERY_QUEUE_CAPACITY: usize = 256;
+    const DISPLAY_EDGE_EPSILON_PX: f64 = 0.001;
+    const DELIVERY_QUEUE_CAPACITY: usize = 1024;
 
     #[derive(Debug, Clone, Copy)]
     struct MoveCommand {
@@ -159,9 +157,16 @@ mod relative_mouse {
         enqueued_at: Instant,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    pub(super) enum ButtonCommand {
+        Click(Button, i64),
+        Press(Button),
+        Release(Button),
+    }
+
     enum DeliveryMessage {
         Move(MoveCommand),
-        Barrier(Sender<()>),
+        Button(ButtonCommand),
     }
 
     pub(super) struct MouseEventDelivery {
@@ -203,11 +208,11 @@ mod relative_mouse {
             }
         }
 
-        fn submit(&self, destination: CGPoint) {
+        fn submit(&self, destination: CGPoint, generation: u64) {
             self.submitted.fetch_add(1, Ordering::Relaxed);
             let command = MoveCommand {
                 destination,
-                generation: self.generation.load(Ordering::Acquire),
+                generation,
                 enqueued_at: Instant::now(),
             };
             if self.tx.try_send(DeliveryMessage::Move(command)).is_err() {
@@ -215,18 +220,26 @@ mod relative_mouse {
             }
         }
 
-        pub(super) fn flush(&self) {
-            let (ack_tx, ack_rx) = bounded(0);
+        fn current_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+
+        pub(super) fn submit_button(
+            &self,
+            command: ButtonCommand,
+        ) -> InputResult<()> {
             if self
                 .tx
                 .send_timeout(
-                    DeliveryMessage::Barrier(ack_tx),
-                    Duration::from_millis(250),
+                    DeliveryMessage::Button(command),
+                    Duration::from_millis(4),
                 )
-                .is_ok()
+                .is_err()
             {
-                let _ = ack_rx.recv_timeout(Duration::from_millis(250));
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return Err(InputError::Simulate("mouse delivery queue is full"));
             }
+            Ok(())
         }
     }
 
@@ -258,13 +271,14 @@ mod relative_mouse {
     #[derive(Debug, Clone, Copy)]
     struct MovePlan {
         destination: CGPoint,
-        recover_cursor: bool,
+        prediction_clamped: bool,
         stalled_posts: u8,
     }
 
-    /// Keeps absolute Quartz events moving when WindowServer applies the
-    /// previous event late. The lead is bounded so a display edge can never
-    /// accumulate an arbitrarily long invisible catch-up tail.
+    /// Tracks the newest intended absolute position while WindowServer may be
+    /// applying an older event. The target accumulates only inside active
+    /// display bounds, so a long delivery stall preserves intent without
+    /// creating invisible distance beyond a screen edge.
     #[derive(Debug, Default)]
     pub(super) struct TargetTracker {
         target: Option<CGPoint>,
@@ -274,9 +288,21 @@ mod relative_mouse {
         display_epoch: Option<u64>,
         display_bounds: Vec<CGRect>,
         display_bounds_epoch: Option<u64>,
+        generation: Option<u64>,
     }
 
     impl TargetTracker {
+        fn reset_if_generation_changed(&mut self, generation: u64) {
+            if self.generation == Some(generation) {
+                return;
+            }
+            self.target = None;
+            self.last_actual = None;
+            self.stalled_posts = 0;
+            self.last_post_at = None;
+            self.generation = Some(generation);
+        }
+
         fn destination(
             &mut self,
             actual: CGPoint,
@@ -289,10 +315,6 @@ mod relative_mouse {
                 now.saturating_duration_since(last) >= RESYNC_AFTER_IDLE
             });
             let display_changed = self.display_epoch != Some(display_epoch);
-            let target_too_far = self.target.is_some_and(|target| {
-                (target.x - actual.x).abs() > MAX_PREDICTED_LEAD_PX
-                    || (target.y - actual.y).abs() > MAX_PREDICTED_LEAD_PX
-            });
             let pending = self
                 .target
                 .map(|target| CGPoint::new(target.x - actual.x, target.y - actual.y))
@@ -318,11 +340,7 @@ mod relative_mouse {
                 self.stalled_posts = self.stalled_posts.saturating_add(1);
             }
 
-            if self.target.is_none()
-                || idle
-                || display_changed
-                || direction_reversed
-                || target_too_far
+            if self.target.is_none() || idle || display_changed || direction_reversed
             {
                 self.target = Some(actual);
             }
@@ -333,15 +351,14 @@ mod relative_mouse {
                 axis_base(actual.y, target.y, dy),
             );
             let requested = offset_point(base, dx, dy);
-            let destination = CGPoint::new(
-                requested.x.clamp(
-                    actual.x - MAX_PREDICTED_LEAD_PX,
-                    actual.x + MAX_PREDICTED_LEAD_PX,
-                ),
-                requested.y.clamp(
-                    actual.y - MAX_PREDICTED_LEAD_PX,
-                    actual.y + MAX_PREDICTED_LEAD_PX,
-                ),
+            let prediction_clamped = (requested.x - actual.x).abs()
+                > MAX_DELIVERY_STEP_PX
+                || (requested.y - actual.y).abs() > MAX_DELIVERY_STEP_PX;
+            let destination = self.constrain_to_active_displays(
+                base,
+                actual,
+                requested,
+                display_epoch,
             );
 
             self.target = Some(destination);
@@ -350,16 +367,12 @@ mod relative_mouse {
             self.display_epoch = Some(display_epoch);
             MovePlan {
                 destination,
-                recover_cursor: self.stalled_posts >= RECOVER_AFTER_STALLED_POSTS,
+                prediction_clamped,
                 stalled_posts: self.stalled_posts,
             }
         }
 
-        fn destination_is_on_display(
-            &mut self,
-            destination: CGPoint,
-            display_epoch: u64,
-        ) -> bool {
+        fn refresh_display_bounds(&mut self, display_epoch: u64) {
             if self.display_bounds_epoch != Some(display_epoch) {
                 self.display_bounds = CGDisplay::active_displays()
                     .unwrap_or_default()
@@ -368,10 +381,89 @@ mod relative_mouse {
                     .collect();
                 self.display_bounds_epoch = Some(display_epoch);
             }
-            self.display_bounds
-                .iter()
-                .any(|bounds| bounds.contains(&destination))
         }
+
+        fn constrain_to_active_displays(
+            &mut self,
+            base: CGPoint,
+            actual: CGPoint,
+            requested: CGPoint,
+            display_epoch: u64,
+        ) -> CGPoint {
+            self.refresh_display_bounds(display_epoch);
+            if self.display_bounds.is_empty() {
+                return requested;
+            }
+
+            let current_index = self
+                .display_bounds
+                .iter()
+                .position(|bounds| bounds.contains(&base))
+                .or_else(|| {
+                    self.display_bounds
+                        .iter()
+                        .position(|bounds| bounds.contains(&actual))
+                });
+            let requested_index = self
+                .display_bounds
+                .iter()
+                .position(|bounds| bounds.contains(&requested));
+            if let Some(requested_index) = requested_index {
+                let connected = current_index.map_or(true, |current_index| {
+                    current_index == requested_index
+                        || displays_touch(
+                            &self.display_bounds[current_index],
+                            &self.display_bounds[requested_index],
+                        )
+                });
+                if connected {
+                    return requested;
+                }
+            }
+
+            let current = current_index
+                .and_then(|index| self.display_bounds.get(index))
+                .or_else(|| {
+                    self.display_bounds
+                        .iter()
+                        .find(|bounds| bounds.contains(&base))
+                });
+            let Some(bounds) = current else {
+                return actual;
+            };
+            let min_x = bounds.origin.x;
+            let min_y = bounds.origin.y;
+            let max_x = (bounds.origin.x + bounds.size.width
+                - DISPLAY_EDGE_EPSILON_PX)
+                .max(min_x);
+            let max_y = (bounds.origin.y + bounds.size.height
+                - DISPLAY_EDGE_EPSILON_PX)
+                .max(min_y);
+            CGPoint::new(
+                requested.x.clamp(min_x, max_x),
+                requested.y.clamp(min_y, max_y),
+            )
+        }
+    }
+
+    fn displays_touch(first: &CGRect, second: &CGRect) -> bool {
+        let first_max_x = first.origin.x + first.size.width;
+        let first_max_y = first.origin.y + first.size.height;
+        let second_max_x = second.origin.x + second.size.width;
+        let second_max_y = second.origin.y + second.size.height;
+        let y_overlap =
+            first.origin.y < second_max_y && second.origin.y < first_max_y;
+        let x_overlap =
+            first.origin.x < second_max_x && second.origin.x < first_max_x;
+        let horizontal_touch = ((first_max_x - second.origin.x).abs()
+            <= DISPLAY_EDGE_EPSILON_PX
+            || (second_max_x - first.origin.x).abs() <= DISPLAY_EDGE_EPSILON_PX)
+            && y_overlap;
+        let vertical_touch = ((first_max_y - second.origin.y).abs()
+            <= DISPLAY_EDGE_EPSILON_PX
+            || (second_max_y - first.origin.y).abs() <= DISPLAY_EDGE_EPSILON_PX)
+            && x_overlap;
+        horizontal_touch || vertical_touch
     }
 
     fn axis_reversed(pending: f64, delta: i32) -> bool {
@@ -397,14 +489,6 @@ mod relative_mouse {
     #[inline]
     fn movement_event_flags() -> CGEventFlags {
         CGEventFlags::empty()
-    }
-
-    #[inline]
-    fn should_warp_visual_cursor(
-        recovery_required: bool,
-        destination_is_on_display: bool,
-    ) -> bool {
-        recovery_required && destination_is_on_display
     }
 
     const DELIVERY_LATENCY_BUCKETS_US: [u64; 12] = [
@@ -481,7 +565,12 @@ mod relative_mouse {
         queue_age: DeliveryTimingStats,
         coalesced: u64,
         generation_cancelled: u64,
-        barriers: u64,
+        button_commands: u64,
+        button_post: DeliveryTimingStats,
+        delivery_step_samples: u64,
+        delivery_step_total_px: u64,
+        delivery_step_max_px: u64,
+        delivery_step_limited: u64,
         post_over_4ms: u64,
         post_over_16ms: u64,
         post_over_50ms: u64,
@@ -495,7 +584,12 @@ mod relative_mouse {
                 queue_age: DeliveryTimingStats::default(),
                 coalesced: 0,
                 generation_cancelled: 0,
-                barriers: 0,
+                button_commands: 0,
+                button_post: DeliveryTimingStats::default(),
+                delivery_step_samples: 0,
+                delivery_step_total_px: 0,
+                delivery_step_max_px: 0,
+                delivery_step_limited: 0,
                 post_over_4ms: 0,
                 post_over_16ms: 0,
                 post_over_50ms: 0,
@@ -508,6 +602,14 @@ mod relative_mouse {
             self.post_over_4ms += u64::from(elapsed > Duration::from_millis(4));
             self.post_over_16ms += u64::from(elapsed > Duration::from_millis(16));
             self.post_over_50ms += u64::from(elapsed > Duration::from_millis(50));
+        }
+
+        fn record_delivery_step(&mut self, observation: MovementPost) {
+            self.delivery_step_samples += 1;
+            self.delivery_step_total_px += observation.step_axis_px;
+            self.delivery_step_max_px =
+                self.delivery_step_max_px.max(observation.step_axis_px);
+            self.delivery_step_limited += u64::from(observation.step_limited);
         }
 
         fn maybe_report(
@@ -524,23 +626,34 @@ mod relative_mouse {
             }
             let submitted = submitted.swap(0, Ordering::Relaxed);
             let dropped = dropped.swap(0, Ordering::Relaxed);
-            if submitted > 0 || self.post.samples > 0 || dropped > 0 {
+            if submitted > 0
+                || self.post.samples > 0
+                || self.button_commands > 0
+                || dropped > 0
+            {
                 padjutsu_metrics::metric!(
                     "mouse-delivery",
-                    "[mouse-delivery-metrics] window_ms={} submitted={} posts={} coalesced={} generation_cancelled={} dropped={} barriers={} queue_len={} mouse_event_post_us({}) mouse_event_post_over_4ms={} mouse_event_post_over_16ms={} mouse_event_post_over_50ms={} delivery_queue_age_us({})",
+                    "[mouse-delivery-metrics] window_ms={} submitted={} posts={} coalesced={} generation_cancelled={} dropped={} button_commands={} queue_len={} mouse_event_post_us({}) mouse_event_post_over_4ms={} mouse_event_post_over_16ms={} mouse_event_post_over_50ms={} delivery_queue_age_us({}) delivery_step_px(n={},avg={},max={}) delivery_step_limited={} mouse_button_post_us({})",
                     self.started_at.elapsed().as_millis(),
                     submitted,
                     self.post.samples,
                     self.coalesced,
                     self.generation_cancelled,
                     dropped,
-                    self.barriers,
+                    self.button_commands,
                     queue_len,
                     self.post.summary(),
                     self.post_over_4ms,
                     self.post_over_16ms,
                     self.post_over_50ms,
                     self.queue_age.summary(),
+                    self.delivery_step_samples,
+                    self.delivery_step_total_px
+                        .checked_div(self.delivery_step_samples)
+                        .unwrap_or(0),
+                    self.delivery_step_max_px,
+                    self.delivery_step_limited,
+                    self.button_post.summary(),
                 );
             }
             *self = Self::new();
@@ -559,8 +672,8 @@ mod relative_mouse {
                     latest = next;
                     coalesced += 1;
                 }
-                barrier @ DeliveryMessage::Barrier(_) => {
-                    *pending = Some(barrier);
+                button @ DeliveryMessage::Button(_) => {
+                    *pending = Some(button);
                     break;
                 }
             }
@@ -568,7 +681,29 @@ mod relative_mouse {
         (latest, coalesced)
     }
 
-    fn post_movement_event(destination: CGPoint) -> Result<(), ()> {
+    #[derive(Debug, Clone, Copy)]
+    struct MovementPost {
+        step_axis_px: u64,
+        step_limited: bool,
+    }
+
+    fn bounded_delivery_destination(
+        actual: CGPoint,
+        target: CGPoint,
+    ) -> (CGPoint, bool) {
+        let destination = CGPoint::new(
+            actual.x
+                + (target.x - actual.x)
+                    .clamp(-MAX_DELIVERY_STEP_PX, MAX_DELIVERY_STEP_PX),
+            actual.y
+                + (target.y - actual.y)
+                    .clamp(-MAX_DELIVERY_STEP_PX, MAX_DELIVERY_STEP_PX),
+        );
+        let limited = destination.x != target.x || destination.y != target.y;
+        (destination, limited)
+    }
+
+    fn post_movement_event(target: CGPoint) -> Result<MovementPost, ()> {
         let pressed = unsafe { NSEvent::pressedMouseButtons() };
         let (event_type, button) = if pressed & 1 > 0 {
             (CGEventType::LeftMouseDragged, CGMouseButton::Left)
@@ -577,10 +712,19 @@ mod relative_mouse {
         } else {
             (CGEventType::MouseMoved, CGMouseButton::Left)
         };
-        let event = super::cg_source::with(|source| {
-            CGEvent::new_mouse_event(source.clone(), event_type, destination, button)
-        })
-        .map_err(|_| ())??;
+        let (actual, destination, event) =
+            super::cg_source::with(|source| -> Result<_, ()> {
+                let actual = CGEvent::new(source.clone())?.location();
+                let (destination, _) = bounded_delivery_destination(actual, target);
+                let event = CGEvent::new_mouse_event(
+                    source.clone(),
+                    event_type,
+                    destination,
+                    button,
+                )?;
+                Ok((actual, destination, event))
+            })
+            .map_err(|_| ())??;
         let (delta_x, delta_y) = movement_delta_fields(0, 0);
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, delta_x);
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, delta_y);
@@ -590,7 +734,13 @@ mod relative_mouse {
         );
         event.set_flags(movement_event_flags());
         event.post(CGEventTapLocation::HID);
-        Ok(())
+        Ok(MovementPost {
+            step_axis_px: (destination.x - actual.x)
+                .abs()
+                .max((destination.y - actual.y).abs())
+                .round() as u64,
+            step_limited: destination.x != target.x || destination.y != target.y,
+        })
     }
 
     fn run_delivery(
@@ -626,14 +776,29 @@ mod relative_mouse {
                     let started_at = Instant::now();
                     let queue_age =
                         started_at.saturating_duration_since(command.enqueued_at);
-                    let _ = super::with_pool(|| {
+                    let observation = super::with_pool(|| {
                         post_movement_event(command.destination)
                     });
+                    if let Ok(observation) = observation {
+                        metrics.record_delivery_step(observation);
+                    }
                     metrics.record_post(queue_age, started_at.elapsed());
                 }
-                DeliveryMessage::Barrier(ack) => {
-                    metrics.barriers += 1;
-                    let _ = ack.send(());
+                DeliveryMessage::Button(command) => {
+                    let started_at = Instant::now();
+                    let _ = super::with_pool(|| match command {
+                        ButtonCommand::Click(button, count) => {
+                            super::native_mouse::click(button, count)
+                        }
+                        ButtonCommand::Press(button) => {
+                            super::native_mouse::press(button)
+                        }
+                        ButtonCommand::Release(button) => {
+                            super::native_mouse::release(button)
+                        }
+                    });
+                    metrics.button_commands += 1;
+                    metrics.button_post.record(started_at.elapsed());
                 }
             }
             metrics.maybe_report(&submitted, &dropped, rx.len(), false);
@@ -654,6 +819,8 @@ mod relative_mouse {
     ) -> InputResult<MouseMoveObservation> {
         let display_epoch = super::display_configuration::epoch();
         let now = Instant::now();
+        let generation = delivery.current_generation();
+        tracker.reset_if_generation_changed(generation);
         let (point, plan) = super::cg_source::with(|source| -> Result<_, ()> {
             let point = CGEvent::new(source.clone())?.location();
             let plan = tracker.destination(point, dx, dy, display_epoch, now);
@@ -662,34 +829,25 @@ mod relative_mouse {
         .map_err(|_| InputError::Simulate("failed to create mouse source"))?
         .map_err(|_| InputError::Simulate("failed reading cursor position"))?;
 
-        // A warp itself can synchronize with the compositor for a full frame,
-        // so reserve it for confirmed stale delivery. Normal movement is sent
-        // through the bounded delivery worker below.
-        let visual_warp_attempted = plan.recover_cursor
-            && should_warp_visual_cursor(
-                plan.recover_cursor,
-                tracker.destination_is_on_display(plan.destination, display_epoch),
-            );
-        let warp_started_at = Instant::now();
-        let visual_warped = visual_warp_attempted
-            && CGDisplay::warp_mouse_cursor_position(plan.destination).is_ok();
-        let warp_duration = if visual_warp_attempted {
-            warp_started_at.elapsed()
-        } else {
-            Duration::ZERO
-        };
-        let recovery_warped = plan.recover_cursor && visual_warped;
-        delivery.submit(plan.destination);
+        // Do not call CGWarp from the realtime planning path. With async event
+        // delivery a stale Quartz position means "still pending", not "lost";
+        // synchronous recovery would amplify compositor stalls.
+        delivery.submit(plan.destination, generation);
+        let planned_dx = (plan.destination.x - point.x)
+            .clamp(-MAX_DELIVERY_STEP_PX, MAX_DELIVERY_STEP_PX);
+        let planned_dy = (plan.destination.y - point.y)
+            .clamp(-MAX_DELIVERY_STEP_PX, MAX_DELIVERY_STEP_PX);
         Ok(MouseMoveObservation {
             x: point.x.round() as i32,
             y: point.y.round() as i32,
-            posted_dx: (plan.destination.x - point.x).round() as i32,
-            posted_dy: (plan.destination.y - point.y).round() as i32,
-            recovery_warped,
-            visual_warp_attempted,
-            visual_warped,
+            posted_dx: planned_dx.round() as i32,
+            posted_dy: planned_dy.round() as i32,
+            prediction_clamped: plan.prediction_clamped,
+            recovery_warped: false,
+            visual_warp_attempted: false,
+            visual_warped: false,
             stalled_posts: plan.stalled_posts,
-            warp_duration,
+            warp_duration: Duration::ZERO,
             display_epoch,
         })
     }
@@ -713,6 +871,21 @@ mod relative_mouse {
 
         use super::*;
 
+        fn tracker_with_bounds(bounds: Vec<CGRect>, epoch: u64) -> TargetTracker {
+            TargetTracker {
+                display_bounds: bounds,
+                display_bounds_epoch: Some(epoch),
+                ..TargetTracker::default()
+            }
+        }
+
+        fn large_test_display() -> CGRect {
+            CGRect::new(
+                &CGPoint::new(-1_000.0, -1_000.0),
+                &CGSize::new(5_000.0, 5_000.0),
+            )
+        }
+
         #[test]
         fn movement_events_allow_window_server_coalescing() {
             let flags = movement_event_flags();
@@ -729,10 +902,10 @@ mod relative_mouse {
         }
 
         #[test]
-        fn stale_quartz_position_accumulates_only_a_bounded_lead() {
+        fn stale_async_delivery_preserves_intent_for_paced_delivery() {
             let actual = CGPoint::new(100.0, 200.0);
             let started_at = Instant::now();
-            let mut tracker = TargetTracker::default();
+            let mut tracker = tracker_with_bounds(vec![large_test_display()], 0);
 
             let first = tracker.destination(actual, 10, 0, 0, started_at);
             let second = tracker.destination(
@@ -754,16 +927,17 @@ mod relative_mouse {
 
             assert_eq!(first.destination.x, 110.0);
             assert_eq!(second.destination.x, 120.0);
-            assert_eq!(fifth.destination.x, 132.0);
+            assert_eq!(fifth.destination.x, 150.0);
             assert_eq!(fifth.destination.y, actual.y);
-            assert!(fifth.recover_cursor);
+            assert!(fifth.prediction_clamped);
+            assert_eq!(fifth.stalled_posts, 4);
         }
 
         #[test]
         fn reversing_direction_discards_unapplied_cursor_lead() {
             let actual = CGPoint::new(100.0, 200.0);
             let started_at = Instant::now();
-            let mut tracker = TargetTracker::default();
+            let mut tracker = tracker_with_bounds(vec![large_test_display()], 0);
             let _ = tracker.destination(actual, 20, 0, 0, started_at);
             let reversed = tracker.destination(
                 actual,
@@ -774,13 +948,13 @@ mod relative_mouse {
             );
 
             assert_eq!(reversed.destination.x, 95.0);
-            assert!(!reversed.recover_cursor);
+            assert_eq!(reversed.stalled_posts, 0);
         }
 
         #[test]
         fn idle_or_display_change_resynchronizes_with_live_cursor() {
             let started_at = Instant::now();
-            let mut tracker = TargetTracker::default();
+            let mut tracker = tracker_with_bounds(vec![large_test_display()], 0);
             let _ = tracker.destination(
                 CGPoint::new(100.0, 200.0),
                 20,
@@ -796,6 +970,8 @@ mod relative_mouse {
                 0,
                 started_at + Duration::from_millis(100),
             );
+            tracker.display_bounds = vec![large_test_display()];
+            tracker.display_bounds_epoch = Some(1);
             let after_display_change = tracker.destination(
                 CGPoint::new(-300.0, 50.0),
                 4,
@@ -806,17 +982,16 @@ mod relative_mouse {
 
             assert_eq!(after_idle.destination.x, 504.0);
             assert_eq!(after_idle.destination.y, 600.0);
-            assert!(!after_idle.recover_cursor);
+            assert_eq!(after_idle.stalled_posts, 0);
             assert_eq!(after_display_change.destination.x, -296.0);
             assert_eq!(after_display_change.destination.y, 50.0);
-            assert!(!after_display_change.recover_cursor);
+            assert_eq!(after_display_change.stalled_posts, 0);
         }
 
         #[test]
-        fn cursor_recovery_handles_one_confirmed_stale_post_and_resets_on_progress()
-        {
+        fn stale_delivery_is_observed_without_triggering_synchronous_recovery() {
             let started_at = Instant::now();
-            let mut tracker = TargetTracker::default();
+            let mut tracker = tracker_with_bounds(vec![large_test_display()], 0);
 
             let first = tracker.destination(
                 CGPoint::new(100.0, 200.0),
@@ -847,58 +1022,80 @@ mod relative_mouse {
                 started_at + Duration::from_millis(24),
             );
 
-            assert!(!first.recover_cursor);
-            assert!(one_stale.recover_cursor);
+            assert_eq!(first.stalled_posts, 0);
             assert_eq!(one_stale.stalled_posts, 1);
-            assert!(two_stale.recover_cursor);
             assert_eq!(two_stale.stalled_posts, 2);
-            assert!(!progressed.recover_cursor);
             assert_eq!(progressed.stalled_posts, 0);
         }
 
         #[test]
-        fn cursor_recovery_does_not_treat_display_gaps_as_warp_targets() {
+        fn neutral_generation_discards_unapplied_target_before_resume() {
+            let actual = CGPoint::new(100.0, 200.0);
+            let started_at = Instant::now();
+            let mut tracker = tracker_with_bounds(vec![large_test_display()], 0);
+            tracker.reset_if_generation_changed(7);
+            for tick in 0..10 {
+                tracker.destination(
+                    actual,
+                    20,
+                    0,
+                    0,
+                    started_at + Duration::from_millis(tick * 8),
+                );
+            }
+
+            tracker.reset_if_generation_changed(8);
+            let resumed = tracker.destination(
+                actual,
+                4,
+                0,
+                0,
+                started_at + Duration::from_millis(81),
+            );
+
+            assert_eq!(resumed.destination.x, 104.0);
+            assert!(!resumed.prediction_clamped);
+        }
+
+        #[test]
+        fn accumulated_target_stops_at_display_edge_instead_of_entering_gap() {
             let left =
                 CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(100.0, 100.0));
             let right =
                 CGRect::new(&CGPoint::new(200.0, 0.0), &CGSize::new(100.0, 100.0));
-            let bounds = [left, right];
+            let started_at = Instant::now();
+            let mut tracker = tracker_with_bounds(vec![left, right], 0);
+            let edge =
+                tracker.destination(CGPoint::new(95.0, 50.0), 20, 0, 0, started_at);
 
-            assert!(bounds
-                .iter()
-                .any(|rect| rect.contains(&CGPoint::new(50.0, 50.0))));
-            assert!(bounds
-                .iter()
-                .any(|rect| rect.contains(&CGPoint::new(250.0, 50.0))));
-            assert!(!bounds
-                .iter()
-                .any(|rect| rect.contains(&CGPoint::new(150.0, 50.0))));
+            assert!((edge.destination.x - 99.999).abs() < 0.000_1);
+            assert_eq!(edge.destination.y, 50.0);
         }
 
         #[test]
-        fn visual_warp_is_reserved_for_a_confirmed_stale_delivery() {
-            let started_at = Instant::now();
-            let mut tracker = TargetTracker::default();
-            let first = tracker.destination(
-                CGPoint::new(100.0, 200.0),
-                10,
-                0,
-                0,
-                started_at,
-            );
-            let stale = tracker.destination(
-                CGPoint::new(100.0, 200.0),
-                10,
-                0,
-                0,
-                started_at + Duration::from_millis(8),
-            );
+        fn delivery_turns_a_far_target_into_a_normal_sized_step() {
+            let actual = CGPoint::new(100.0, 200.0);
+            let target = CGPoint::new(900.0, -400.0);
 
-            assert!(!first.recover_cursor);
-            assert!(stale.recover_cursor);
-            assert!(!should_warp_visual_cursor(first.recover_cursor, true));
-            assert!(should_warp_visual_cursor(stale.recover_cursor, true));
-            assert!(!should_warp_visual_cursor(stale.recover_cursor, false));
+            let (destination, limited) =
+                bounded_delivery_destination(actual, target);
+
+            assert_eq!(destination.x, 124.0);
+            assert_eq!(destination.y, 176.0);
+            assert!(limited);
+        }
+
+        #[test]
+        fn touching_displays_allow_crossing_but_a_gap_does_not() {
+            let left =
+                CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(100.0, 100.0));
+            let touching =
+                CGRect::new(&CGPoint::new(100.0, 0.0), &CGSize::new(100.0, 100.0));
+            let separated =
+                CGRect::new(&CGPoint::new(101.0, 0.0), &CGSize::new(100.0, 100.0));
+
+            assert!(displays_touch(&left, &touching));
+            assert!(!displays_touch(&left, &separated));
         }
 
         #[test]
@@ -912,8 +1109,11 @@ mod relative_mouse {
             };
             tx.send(DeliveryMessage::Move(command(110.0))).unwrap();
             tx.send(DeliveryMessage::Move(command(120.0))).unwrap();
-            let (ack_tx, _ack_rx) = bounded(0);
-            tx.send(DeliveryMessage::Barrier(ack_tx)).unwrap();
+            tx.send(DeliveryMessage::Button(ButtonCommand::Click(
+                Button::Left,
+                1,
+            )))
+            .unwrap();
             tx.send(DeliveryMessage::Move(command(130.0))).unwrap();
 
             let DeliveryMessage::Move(first) = rx.recv().unwrap() else {
@@ -924,7 +1124,7 @@ mod relative_mouse {
 
             assert_eq!(latest.destination.x, 120.0);
             assert_eq!(coalesced, 1);
-            assert!(matches!(pending, Some(DeliveryMessage::Barrier(_))));
+            assert!(matches!(pending, Some(DeliveryMessage::Button(_))));
             assert!(matches!(rx.recv().unwrap(), DeliveryMessage::Move(_)));
         }
     }
@@ -1458,8 +1658,8 @@ impl Performer {
     /// Click a mouse button.
     #[cfg(target_os = "macos")]
     pub fn mouse_click(&mut self, button: Button) -> InputResult<()> {
-        self.mouse_delivery.flush();
-        with_pool(|| native_mouse::click(button, 1))
+        self.mouse_delivery
+            .submit_button(relative_mouse::ButtonCommand::Click(button, 1))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1470,8 +1670,8 @@ impl Performer {
     /// Double-click a mouse button.
     #[cfg(target_os = "macos")]
     pub fn mouse_double_click(&mut self, button: Button) -> InputResult<()> {
-        self.mouse_delivery.flush();
-        with_pool(|| native_mouse::click(button, 2))
+        self.mouse_delivery
+            .submit_button(relative_mouse::ButtonCommand::Click(button, 2))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1485,8 +1685,8 @@ impl Performer {
     /// Press a mouse button (hold down).
     #[cfg(target_os = "macos")]
     pub fn mouse_press(&mut self, button: Button) -> InputResult<()> {
-        self.mouse_delivery.flush();
-        with_pool(|| native_mouse::press(button))
+        self.mouse_delivery
+            .submit_button(relative_mouse::ButtonCommand::Press(button))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1497,8 +1697,8 @@ impl Performer {
     /// Release a mouse button.
     #[cfg(target_os = "macos")]
     pub fn mouse_release(&mut self, button: Button) -> InputResult<()> {
-        self.mouse_delivery.flush();
-        with_pool(|| native_mouse::release(button))
+        self.mouse_delivery
+            .submit_button(relative_mouse::ButtonCommand::Release(button))
     }
 
     #[cfg(not(target_os = "macos"))]

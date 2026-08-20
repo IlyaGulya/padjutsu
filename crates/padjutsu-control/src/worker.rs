@@ -537,6 +537,7 @@ struct WorkerMetrics {
     mouse_delta_change_axis: ValueStats,
     mouse_posted_delta_axis: ValueStats,
     mouse_prediction_extra_axis: ValueStats,
+    mouse_prediction_clamped: u64,
     cursor_tracking_error_axis: ValueStats,
     cursor_stalled: u64,
     cursor_recovery_warps: u64,
@@ -587,6 +588,7 @@ impl WorkerMetrics {
             mouse_delta_change_axis: ValueStats::default(),
             mouse_posted_delta_axis: ValueStats::default(),
             mouse_prediction_extra_axis: ValueStats::default(),
+            mouse_prediction_clamped: 0,
             cursor_tracking_error_axis: ValueStats::default(),
             cursor_stalled: 0,
             cursor_recovery_warps: 0,
@@ -700,6 +702,8 @@ impl WorkerMetrics {
                 .max(i64::from(posted_delta.1).abs_diff(i64::from(dy))),
         );
         if let Some(observation) = observation {
+            self.mouse_prediction_clamped +=
+                u64::from(observation.prediction_clamped);
             self.mouse_visual_warp_attempts +=
                 u64::from(observation.visual_warp_attempted);
             self.mouse_visual_warps += u64::from(observation.visual_warped);
@@ -778,7 +782,7 @@ impl WorkerMetrics {
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         padjutsu_metrics::metric!(
             "performer",
-            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_visual_warp_attempts={} mouse_visual_warps={} mouse_visual_warp_failures={} mouse_warp_us({}) mouse_warp_over_4ms={} mouse_warp_over_16ms={} mouse_warp_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) mouse_posted_delta_axis_px({}) mouse_prediction_extra_axis_px({}) cursor_tracking_error_axis_px({}) cursor_stalled={} cursor_recovery_warps={} cursor_stall_sequence_max={} display_epoch={} display_reconfiguration_events={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
+            "[performer-metrics] window_ms={} batches={} commands={} executions={} coalesced={} dropped={} max_batch={} queue_len={} queue_wait_us({}) queue_wait_over_4ms={} queue_wait_over_16ms={} mouse_post_us({}) mouse_post_over_4ms={} mouse_post_over_16ms={} mouse_post_over_50ms={} mouse_visual_warp_attempts={} mouse_visual_warps={} mouse_visual_warp_failures={} mouse_warp_us({}) mouse_warp_over_4ms={} mouse_warp_over_16ms={} mouse_warp_over_50ms={} mouse_interval_us({}) mouse_input_age_us({}) mouse_delta_axis_px({}) mouse_delta_change_axis_px({}) mouse_posted_delta_axis_px({}) mouse_prediction_extra_axis_px({}) mouse_prediction_clamped={} cursor_tracking_error_axis_px({}) cursor_stalled={} cursor_recovery_warps={} cursor_stall_sequence_max={} display_epoch={} display_reconfiguration_events={} mouse_posts={} mouse_commands={} cancelled_mouse_commands={} clamped_mouse_posts={} max_mouse_commands_per_post={} scroll_post_us({}) other_execution_us({})",
             self.started_at.elapsed().as_millis(),
             self.batches,
             self.commands,
@@ -807,6 +811,7 @@ impl WorkerMetrics {
             self.mouse_delta_change_axis.summary(),
             self.mouse_posted_delta_axis.summary(),
             self.mouse_prediction_extra_axis.summary(),
+            self.mouse_prediction_clamped,
             self.cursor_tracking_error_axis.summary(),
             self.cursor_stalled,
             self.cursor_recovery_warps,
@@ -1021,6 +1026,7 @@ mod tests {
                 y: 100,
                 posted_dx: 5,
                 posted_dy: 0,
+                prediction_clamped: false,
                 recovery_warped: false,
                 visual_warp_attempted: true,
                 visual_warped: true,
@@ -1040,6 +1046,7 @@ mod tests {
                 y: 100,
                 posted_dx: 10,
                 posted_dy: 0,
+                prediction_clamped: true,
                 recovery_warped: true,
                 visual_warp_attempted: true,
                 visual_warped: true,
@@ -1053,6 +1060,7 @@ mod tests {
         assert_eq!(metrics.cursor_tracking_error_axis.max, 5);
         assert_eq!(metrics.mouse_posted_delta_axis.max, 10);
         assert_eq!(metrics.mouse_prediction_extra_axis.max, 5);
+        assert_eq!(metrics.mouse_prediction_clamped, 1);
         assert_eq!(metrics.cursor_recovery_warps, 1);
         assert_eq!(metrics.mouse_visual_warp_attempts, 2);
         assert_eq!(metrics.mouse_visual_warps, 2);
@@ -1090,6 +1098,7 @@ mod tests {
                 y: 100,
                 posted_dx: 5,
                 posted_dy: 0,
+                prediction_clamped: false,
                 recovery_warped: false,
                 visual_warp_attempted: false,
                 visual_warped: false,
@@ -1109,6 +1118,7 @@ mod tests {
                 y: 500,
                 posted_dx: 5,
                 posted_dy: 0,
+                prediction_clamped: false,
                 recovery_warped: false,
                 visual_warp_attempted: false,
                 visual_warped: false,

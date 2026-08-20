@@ -41,6 +41,10 @@ impl WakeState {
     pub fn record_axis_snapshot_corrections(&mut self, count: u64) {
         self.metrics.axis_snapshot_corrections += count;
     }
+
+    pub fn record_button_repeat_snapshot_cancellations(&mut self, count: u64) {
+        self.metrics.button_repeat_snapshot_cancellations += count;
+    }
 }
 
 const WAKE_LATENCY_BUCKETS_US: [u64; 12] = [
@@ -74,6 +78,7 @@ struct WakeMetrics {
     over_8ms: u64,
     over_16ms: u64,
     axis_snapshot_corrections: u64,
+    button_repeat_snapshot_cancellations: u64,
 }
 
 impl WakeMetrics {
@@ -94,6 +99,7 @@ impl WakeMetrics {
             over_8ms: 0,
             over_16ms: 0,
             axis_snapshot_corrections: 0,
+            button_repeat_snapshot_cancellations: 0,
         }
     }
 
@@ -154,7 +160,7 @@ impl WakeMetrics {
         };
         padjutsu_metrics::metric!(
             "wake",
-            "[wake-metrics] window_ms={} wakes={} tick_wakes={} early_wakes={} lateness_us(n={},avg={},p95~{},p99~{},max={}) over_1ms={} over_4ms={} over_8ms={} over_16ms={} axis_snapshot_corrections={}",
+            "[wake-metrics] window_ms={} wakes={} tick_wakes={} early_wakes={} lateness_us(n={},avg={},p95~{},p99~{},max={}) over_1ms={} over_4ms={} over_8ms={} over_16ms={} axis_snapshot_corrections={} button_repeat_snapshot_cancellations={}",
             self.started_at.elapsed().as_millis(),
             self.wakes,
             self.tick_wakes,
@@ -169,6 +175,7 @@ impl WakeMetrics {
             self.over_8ms,
             self.over_16ms,
             self.axis_snapshot_corrections,
+            self.button_repeat_snapshot_cancellations,
         );
         *self = Self::new();
     }
