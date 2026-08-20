@@ -145,14 +145,14 @@ mod relative_mouse {
 
     use super::MouseMoveObservation;
 
-    const MAX_DELIVERY_STEP_PX: f64 = 24.0;
     const RESYNC_AFTER_IDLE: Duration = Duration::from_millis(50);
     const DISPLAY_EDGE_EPSILON_PX: f64 = 0.001;
     const DELIVERY_QUEUE_CAPACITY: usize = 1024;
 
     #[derive(Debug, Clone, Copy)]
     struct MoveCommand {
-        destination: CGPoint,
+        dx: i32,
+        dy: i32,
         generation: u64,
         enqueued_at: Instant,
     }
@@ -208,10 +208,11 @@ mod relative_mouse {
             }
         }
 
-        fn submit(&self, destination: CGPoint, generation: u64) {
+        fn submit(&self, dx: i32, dy: i32, generation: u64) {
             self.submitted.fetch_add(1, Ordering::Relaxed);
             let command = MoveCommand {
-                destination,
+                dx,
+                dy,
                 generation,
                 enqueued_at: Instant::now(),
             };
@@ -271,14 +272,13 @@ mod relative_mouse {
     #[derive(Debug, Clone, Copy)]
     struct MovePlan {
         destination: CGPoint,
-        prediction_clamped: bool,
         stalled_posts: u8,
     }
 
-    /// Tracks the newest intended absolute position while WindowServer may be
-    /// applying an older event. The target accumulates only inside active
-    /// display bounds, so a long delivery stall preserves intent without
-    /// creating invisible distance beyond a screen edge.
+    /// Tracks display bounds and whether WindowServer has applied the previous
+    /// move. Every destination starts at the live cursor: elapsed movement is
+    /// deliberately dropped while WindowServer is blocked, never replayed as
+    /// cursor debt after it recovers.
     #[derive(Debug, Default)]
     pub(super) struct TargetTracker {
         target: Option<CGPoint>,
@@ -340,20 +340,8 @@ mod relative_mouse {
                 self.stalled_posts = self.stalled_posts.saturating_add(1);
             }
 
-            if self.target.is_none() || idle || display_changed || direction_reversed
-            {
-                self.target = Some(actual);
-            }
-
-            let target = self.target.unwrap_or(actual);
-            let base = CGPoint::new(
-                axis_base(actual.x, target.x, dx),
-                axis_base(actual.y, target.y, dy),
-            );
-            let requested = offset_point(base, dx, dy);
-            let prediction_clamped = (requested.x - actual.x).abs()
-                > MAX_DELIVERY_STEP_PX
-                || (requested.y - actual.y).abs() > MAX_DELIVERY_STEP_PX;
+            let base = actual;
+            let requested = offset_point(actual, dx, dy);
             let destination = self.constrain_to_active_displays(
                 base,
                 actual,
@@ -367,7 +355,6 @@ mod relative_mouse {
             self.display_epoch = Some(display_epoch);
             MovePlan {
                 destination,
-                prediction_clamped,
                 stalled_posts: self.stalled_posts,
             }
         }
@@ -470,19 +457,6 @@ mod relative_mouse {
         (pending > 0.0 && delta < 0) || (pending < 0.0 && delta > 0)
     }
 
-    fn axis_base(actual: f64, target: f64, delta: i32) -> f64 {
-        let pending = target - actual;
-        let delta = f64::from(delta);
-        if delta == 0.0
-            || (pending > 0.0 && delta < 0.0)
-            || (pending < 0.0 && delta > 0.0)
-        {
-            actual
-        } else {
-            target
-        }
-    }
-
     /// Mouse moves must remain coalescible. Under WindowServer load,
     /// non-coalesced events form a downstream queue that can keep moving the
     /// cursor after the stick has already returned to neutral.
@@ -571,6 +545,8 @@ mod relative_mouse {
         delivery_step_total_px: u64,
         delivery_step_max_px: u64,
         delivery_step_limited: u64,
+        stale_cursor_posts: u64,
+        stale_cursor_sequence_max: u8,
         post_over_4ms: u64,
         post_over_16ms: u64,
         post_over_50ms: u64,
@@ -590,6 +566,8 @@ mod relative_mouse {
                 delivery_step_total_px: 0,
                 delivery_step_max_px: 0,
                 delivery_step_limited: 0,
+                stale_cursor_posts: 0,
+                stale_cursor_sequence_max: 0,
                 post_over_4ms: 0,
                 post_over_16ms: 0,
                 post_over_50ms: 0,
@@ -610,6 +588,10 @@ mod relative_mouse {
             self.delivery_step_max_px =
                 self.delivery_step_max_px.max(observation.step_axis_px);
             self.delivery_step_limited += u64::from(observation.step_limited);
+            self.stale_cursor_posts += u64::from(observation.stalled_posts > 0);
+            self.stale_cursor_sequence_max = self
+                .stale_cursor_sequence_max
+                .max(observation.stalled_posts);
         }
 
         fn maybe_report(
@@ -633,7 +615,7 @@ mod relative_mouse {
             {
                 padjutsu_metrics::metric!(
                     "mouse-delivery",
-                    "[mouse-delivery-metrics] window_ms={} submitted={} posts={} coalesced={} generation_cancelled={} dropped={} button_commands={} queue_len={} mouse_event_post_us({}) mouse_event_post_over_4ms={} mouse_event_post_over_16ms={} mouse_event_post_over_50ms={} delivery_queue_age_us({}) delivery_step_px(n={},avg={},max={}) delivery_step_limited={} mouse_button_post_us({})",
+                    "[mouse-delivery-metrics] window_ms={} submitted={} posts={} coalesced={} generation_cancelled={} dropped={} button_commands={} queue_len={} mouse_event_post_us({}) mouse_event_post_over_4ms={} mouse_event_post_over_16ms={} mouse_event_post_over_50ms={} delivery_queue_age_us({}) delivery_step_px(n={},avg={},max={}) display_edge_clamped={} stale_cursor_posts={} stale_cursor_sequence_max={} mouse_button_post_us({})",
                     self.started_at.elapsed().as_millis(),
                     submitted,
                     self.post.samples,
@@ -653,6 +635,8 @@ mod relative_mouse {
                         .unwrap_or(0),
                     self.delivery_step_max_px,
                     self.delivery_step_limited,
+                    self.stale_cursor_posts,
+                    self.stale_cursor_sequence_max,
                     self.button_post.summary(),
                 );
             }
@@ -685,25 +669,13 @@ mod relative_mouse {
     struct MovementPost {
         step_axis_px: u64,
         step_limited: bool,
+        stalled_posts: u8,
     }
 
-    fn bounded_delivery_destination(
-        actual: CGPoint,
-        target: CGPoint,
-    ) -> (CGPoint, bool) {
-        let destination = CGPoint::new(
-            actual.x
-                + (target.x - actual.x)
-                    .clamp(-MAX_DELIVERY_STEP_PX, MAX_DELIVERY_STEP_PX),
-            actual.y
-                + (target.y - actual.y)
-                    .clamp(-MAX_DELIVERY_STEP_PX, MAX_DELIVERY_STEP_PX),
-        );
-        let limited = destination.x != target.x || destination.y != target.y;
-        (destination, limited)
-    }
-
-    fn post_movement_event(target: CGPoint) -> Result<MovementPost, ()> {
+    fn post_movement_event(
+        tracker: &mut TargetTracker,
+        command: MoveCommand,
+    ) -> Result<MovementPost, ()> {
         let pressed = unsafe { NSEvent::pressedMouseButtons() };
         let (event_type, button) = if pressed & 1 > 0 {
             (CGEventType::LeftMouseDragged, CGMouseButton::Left)
@@ -712,17 +684,24 @@ mod relative_mouse {
         } else {
             (CGEventType::MouseMoved, CGMouseButton::Left)
         };
-        let (actual, destination, event) =
+        let display_epoch = super::display_configuration::epoch();
+        let (actual, plan, event) =
             super::cg_source::with(|source| -> Result<_, ()> {
                 let actual = CGEvent::new(source.clone())?.location();
-                let (destination, _) = bounded_delivery_destination(actual, target);
+                let plan = tracker.destination(
+                    actual,
+                    command.dx,
+                    command.dy,
+                    display_epoch,
+                    Instant::now(),
+                );
                 let event = CGEvent::new_mouse_event(
                     source.clone(),
                     event_type,
-                    destination,
+                    plan.destination,
                     button,
                 )?;
-                Ok((actual, destination, event))
+                Ok((actual, plan, event))
             })
             .map_err(|_| ())??;
         let (delta_x, delta_y) = movement_delta_fields(0, 0);
@@ -735,11 +714,16 @@ mod relative_mouse {
         event.set_flags(movement_event_flags());
         event.post(CGEventTapLocation::HID);
         Ok(MovementPost {
-            step_axis_px: (destination.x - actual.x)
+            step_axis_px: (plan.destination.x - actual.x)
                 .abs()
-                .max((destination.y - actual.y).abs())
+                .max((plan.destination.y - actual.y).abs())
                 .round() as u64,
-            step_limited: destination.x != target.x || destination.y != target.y,
+            step_limited: {
+                let requested = offset_point(actual, command.dx, command.dy);
+                plan.destination.x != requested.x
+                    || plan.destination.y != requested.y
+            },
+            stalled_posts: plan.stalled_posts,
         })
     }
 
@@ -751,6 +735,7 @@ mod relative_mouse {
         dropped: Arc<AtomicU64>,
     ) {
         let mut metrics = DeliveryMetrics::new();
+        let mut tracker = TargetTracker::default();
         let mut pending = None;
         while !stop.load(Ordering::Acquire) {
             let message = match pending.take() {
@@ -773,11 +758,12 @@ mod relative_mouse {
                         metrics.generation_cancelled += 1;
                         continue;
                     }
+                    tracker.reset_if_generation_changed(command.generation);
                     let started_at = Instant::now();
                     let queue_age =
                         started_at.saturating_duration_since(command.enqueued_at);
                     let observation = super::with_pool(|| {
-                        post_movement_event(command.destination)
+                        post_movement_event(&mut tracker, command)
                     });
                     if let Ok(observation) = observation {
                         metrics.record_delivery_step(observation);
@@ -812,41 +798,33 @@ mod relative_mouse {
     /// dependence on cached display height or AppKit's screen-layout cache,
     /// which can become stale after monitor reconfiguration.
     pub fn post(
-        tracker: &mut TargetTracker,
         delivery: &MouseEventDelivery,
         dx: i32,
         dy: i32,
     ) -> InputResult<MouseMoveObservation> {
         let display_epoch = super::display_configuration::epoch();
-        let now = Instant::now();
         let generation = delivery.current_generation();
-        tracker.reset_if_generation_changed(generation);
-        let (point, plan) = super::cg_source::with(|source| -> Result<_, ()> {
+        let point = super::cg_source::with(|source| -> Result<_, ()> {
             let point = CGEvent::new(source.clone())?.location();
-            let plan = tracker.destination(point, dx, dy, display_epoch, now);
-            Ok((point, plan))
+            Ok(point)
         })
         .map_err(|_| InputError::Simulate("failed to create mouse source"))?
         .map_err(|_| InputError::Simulate("failed reading cursor position"))?;
 
-        // Do not call CGWarp from the realtime planning path. With async event
-        // delivery a stale Quartz position means "still pending", not "lost";
-        // synchronous recovery would amplify compositor stalls.
-        delivery.submit(plan.destination, generation);
-        let planned_dx = (plan.destination.x - point.x)
-            .clamp(-MAX_DELIVERY_STEP_PX, MAX_DELIVERY_STEP_PX);
-        let planned_dy = (plan.destination.y - point.y)
-            .clamp(-MAX_DELIVERY_STEP_PX, MAX_DELIVERY_STEP_PX);
+        // The worker applies this vector from the cursor position that is live
+        // at delivery time. Coalescing therefore drops elapsed motion during a
+        // WindowServer stall instead of replaying an absolute-position debt.
+        delivery.submit(dx, dy, generation);
         Ok(MouseMoveObservation {
             x: point.x.round() as i32,
             y: point.y.round() as i32,
-            posted_dx: planned_dx.round() as i32,
-            posted_dy: planned_dy.round() as i32,
-            prediction_clamped: plan.prediction_clamped,
+            posted_dx: dx,
+            posted_dy: dy,
+            prediction_clamped: false,
             recovery_warped: false,
             visual_warp_attempted: false,
             visual_warped: false,
-            stalled_posts: plan.stalled_posts,
+            stalled_posts: 0,
             warp_duration: Duration::ZERO,
             display_epoch,
         })
@@ -902,7 +880,7 @@ mod relative_mouse {
         }
 
         #[test]
-        fn stale_async_delivery_preserves_intent_for_paced_delivery() {
+        fn stale_async_delivery_drops_elapsed_motion_instead_of_building_debt() {
             let actual = CGPoint::new(100.0, 200.0);
             let started_at = Instant::now();
             let mut tracker = tracker_with_bounds(vec![large_test_display()], 0);
@@ -926,11 +904,21 @@ mod relative_mouse {
             });
 
             assert_eq!(first.destination.x, 110.0);
-            assert_eq!(second.destination.x, 120.0);
-            assert_eq!(fifth.destination.x, 150.0);
+            assert_eq!(second.destination.x, 110.0);
+            assert_eq!(fifth.destination.x, 110.0);
             assert_eq!(fifth.destination.y, actual.y);
-            assert!(fifth.prediction_clamped);
             assert_eq!(fifth.stalled_posts, 4);
+        }
+
+        #[test]
+        fn diagonal_delivery_preserves_the_stick_vector() {
+            let actual = CGPoint::new(100.0, 200.0);
+            let mut tracker = tracker_with_bounds(vec![large_test_display()], 0);
+
+            let plan = tracker.destination(actual, 22, 11, 0, Instant::now());
+
+            assert_eq!(plan.destination.x - actual.x, 22.0);
+            assert_eq!(plan.destination.y - actual.y, 11.0);
         }
 
         #[test]
@@ -1054,7 +1042,6 @@ mod relative_mouse {
             );
 
             assert_eq!(resumed.destination.x, 104.0);
-            assert!(!resumed.prediction_clamped);
         }
 
         #[test]
@@ -1070,19 +1057,6 @@ mod relative_mouse {
 
             assert!((edge.destination.x - 99.999).abs() < 0.000_1);
             assert_eq!(edge.destination.y, 50.0);
-        }
-
-        #[test]
-        fn delivery_turns_a_far_target_into_a_normal_sized_step() {
-            let actual = CGPoint::new(100.0, 200.0);
-            let target = CGPoint::new(900.0, -400.0);
-
-            let (destination, limited) =
-                bounded_delivery_destination(actual, target);
-
-            assert_eq!(destination.x, 124.0);
-            assert_eq!(destination.y, 176.0);
-            assert!(limited);
         }
 
         #[test]
@@ -1102,19 +1076,20 @@ mod relative_mouse {
         fn delayed_delivery_collapses_to_latest_move_without_crossing_barrier() {
             let (tx, rx) = bounded(8);
             let now = Instant::now();
-            let command = |x| MoveCommand {
-                destination: CGPoint::new(x, 200.0),
+            let command = |dx, dy| MoveCommand {
+                dx,
+                dy,
                 generation: 7,
                 enqueued_at: now,
             };
-            tx.send(DeliveryMessage::Move(command(110.0))).unwrap();
-            tx.send(DeliveryMessage::Move(command(120.0))).unwrap();
+            tx.send(DeliveryMessage::Move(command(10, 5))).unwrap();
+            tx.send(DeliveryMessage::Move(command(20, 10))).unwrap();
             tx.send(DeliveryMessage::Button(ButtonCommand::Click(
                 Button::Left,
                 1,
             )))
             .unwrap();
-            tx.send(DeliveryMessage::Move(command(130.0))).unwrap();
+            tx.send(DeliveryMessage::Move(command(30, 15))).unwrap();
 
             let DeliveryMessage::Move(first) = rx.recv().unwrap() else {
                 panic!("first delivery message must be movement");
@@ -1122,7 +1097,7 @@ mod relative_mouse {
             let mut pending = None;
             let (latest, coalesced) = drain_latest_move(first, &rx, &mut pending);
 
-            assert_eq!(latest.destination.x, 120.0);
+            assert_eq!((latest.dx, latest.dy), (20, 10));
             assert_eq!(coalesced, 1);
             assert!(matches!(pending, Some(DeliveryMessage::Button(_))));
             assert!(matches!(rx.recv().unwrap(), DeliveryMessage::Move(_)));
@@ -1502,8 +1477,6 @@ pub struct Performer {
     #[cfg(target_os = "macos")]
     _display_observer: Option<display_configuration::Observer>,
     #[cfg(target_os = "macos")]
-    mouse_target: relative_mouse::TargetTracker,
-    #[cfg(target_os = "macos")]
     mouse_delivery: relative_mouse::MouseEventDelivery,
 }
 
@@ -1545,8 +1518,6 @@ impl Performer {
             #[cfg(target_os = "macos")]
             _display_observer: display_configuration::Observer::register(),
             #[cfg(target_os = "macos")]
-            mouse_target: relative_mouse::TargetTracker::default(),
-            #[cfg(target_os = "macos")]
             mouse_delivery: relative_mouse::MouseEventDelivery::spawn(
                 mouse_generation,
             ),
@@ -1585,10 +1556,7 @@ impl Performer {
         x: i32,
         y: i32,
     ) -> InputResult<Option<MouseMoveObservation>> {
-        with_pool(|| {
-            relative_mouse::post(&mut self.mouse_target, &self.mouse_delivery, x, y)
-        })
-        .map(Some)
+        with_pool(|| relative_mouse::post(&self.mouse_delivery, x, y)).map(Some)
     }
 
     /// Fallback for non-macOS systems.

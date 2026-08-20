@@ -139,13 +139,17 @@ struct QueuedCmd {
     mouse_generation: u64,
 }
 
-const MAX_CATCH_UP_DELTA_AXIS: i32 = 32;
+const MAX_CATCH_UP_DELTA_PX: f64 = 32.0;
 
 fn clamp_mouse_catch_up(dx: i32, dy: i32) -> (i32, i32) {
-    (
-        dx.clamp(-MAX_CATCH_UP_DELTA_AXIS, MAX_CATCH_UP_DELTA_AXIS),
-        dy.clamp(-MAX_CATCH_UP_DELTA_AXIS, MAX_CATCH_UP_DELTA_AXIS),
-    )
+    let dx_f = f64::from(dx);
+    let dy_f = f64::from(dy);
+    let length = dx_f.hypot(dy_f);
+    if length <= MAX_CATCH_UP_DELTA_PX {
+        return (dx, dy);
+    }
+    let scale = MAX_CATCH_UP_DELTA_PX / length;
+    ((dx_f * scale).round() as i32, (dy_f * scale).round() as i32)
 }
 
 fn coalesce_trackpad_scroll(
@@ -948,8 +952,9 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_delta_is_bounded_after_a_system_stall() {
-        assert_eq!(clamp_mouse_catch_up(125, -80), (32, -32));
+    fn catch_up_delta_is_bounded_without_turning_it_diagonal() {
+        assert_eq!(clamp_mouse_catch_up(125, -80), (27, -17));
+        assert_eq!(clamp_mouse_catch_up(64, 32), (29, 14));
         assert_eq!(clamp_mouse_catch_up(23, -12), (23, -12));
     }
 
