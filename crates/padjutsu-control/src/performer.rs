@@ -139,6 +139,7 @@ mod display_configuration {
 
 #[cfg(target_os = "macos")]
 mod relative_mouse {
+    use std::env;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread;
@@ -156,10 +157,37 @@ mod relative_mouse {
     use objc2_app_kit::NSEvent;
 
     use super::{MouseMoveObservation, MouseTrace};
+    use crate::virtual_hid::{NativeHidSink, VirtualHidMouse};
 
     const RESYNC_AFTER_IDLE: Duration = Duration::from_millis(50);
     const DISPLAY_EDGE_EPSILON_PX: f64 = 0.001;
     const DELIVERY_QUEUE_CAPACITY: usize = 1024;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MouseBackendPreference {
+        Quartz,
+        VirtualHid,
+    }
+
+    impl MouseBackendPreference {
+        fn from_environment() -> Self {
+            Self::parse(env::var("PADJUTSU_MOUSE_BACKEND").ok().as_deref())
+        }
+
+        fn parse(value: Option<&str>) -> Self {
+            match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+                Some("virtual-hid" | "virtual_hid" | "hid") => Self::VirtualHid,
+                _ => Self::Quartz,
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Quartz => "quartz",
+                Self::VirtualHid => "virtual_hid",
+            }
+        }
+    }
 
     #[derive(Debug, Clone, Copy)]
     struct MoveCommand {
@@ -218,6 +246,7 @@ mod relative_mouse {
             let stop = Arc::new(AtomicBool::new(false));
             let submitted = Arc::new(AtomicU64::new(0));
             let dropped = Arc::new(AtomicU64::new(0));
+            let backend = MouseBackendPreference::from_environment();
             let join = {
                 let stop = stop.clone();
                 let generation = generation.clone();
@@ -228,7 +257,9 @@ mod relative_mouse {
                     .stack_size(256 * 1024)
                     .spawn(move || {
                         set_user_interactive_qos();
-                        run_delivery(rx, stop, generation, submitted, dropped);
+                        run_delivery(
+                            rx, stop, generation, submitted, dropped, backend,
+                        );
                     })
                     .expect("failed to spawn mouse event delivery worker")
             };
@@ -956,9 +987,42 @@ mod relative_mouse {
         generation: Arc<AtomicU64>,
         submitted: Arc<AtomicU64>,
         dropped: Arc<AtomicU64>,
+        backend_preference: MouseBackendPreference,
     ) {
         let mut metrics = DeliveryMetrics::new();
         let mut tracker = TargetTracker::default();
+        let mut virtual_hid = if backend_preference
+            == MouseBackendPreference::VirtualHid
+        {
+            match NativeHidSink::create() {
+                Ok(sink) => Some(VirtualHidMouse::new(sink)),
+                Err(error) => {
+                    log::error!(
+                        "[mouse-backend] virtual HID initialization failed, falling back to Quartz: {error}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let active_backend = if virtual_hid.is_some() {
+            "virtual_hid"
+        } else {
+            "quartz"
+        };
+        log::info!(
+            "[mouse-backend] requested={} active={active_backend}",
+            backend_preference.label()
+        );
+        padjutsu_metrics::metric!(
+            "mouse-backend",
+            "[mouse-backend-metrics] requested={} active={} fallback={}",
+            backend_preference.label(),
+            active_backend,
+            backend_preference == MouseBackendPreference::VirtualHid
+                && virtual_hid.is_none(),
+        );
         let mut pending = None;
         while !stop.load(Ordering::Acquire) {
             let message = match pending.take() {
@@ -988,14 +1052,28 @@ mod relative_mouse {
                     let command = MoveCommand { dx, dy, ..command };
                     let queue_age =
                         started_at.saturating_duration_since(command.enqueued_at);
-                    let observation = super::with_pool(|| {
-                        post_movement_event(
-                            &mut tracker,
-                            command,
-                            compensation_permille,
-                            compensation_limited,
-                        )
-                    });
+                    let observation = if let Some(mouse) = virtual_hid.as_mut() {
+                        mouse.move_by(command.dx, command.dy).map(|()| MovementPost {
+                            step_axis_px: u64::from(command.dx.unsigned_abs().max(command.dy.unsigned_abs())),
+                            step_limited: false,
+                            stalled_posts: 0,
+                            velocity_compensation_permille: compensation_permille,
+                            velocity_compensation_limited: compensation_limited,
+                            previous_progress_age: None,
+                            previous_stall_age: None,
+                        }).map_err(|error| {
+                            log::error!("[mouse-backend] virtual HID movement report failed: {error:?}");
+                        })
+                    } else {
+                        super::with_pool(|| {
+                            post_movement_event(
+                                &mut tracker,
+                                command,
+                                compensation_permille,
+                                compensation_limited,
+                            )
+                        })
+                    };
                     let post_elapsed = started_at.elapsed();
                     let stalled_posts = observation
                         .as_ref()
@@ -1018,17 +1096,30 @@ mod relative_mouse {
                     let started_at = Instant::now();
                     let command = delivery_command.command;
                     let kind_index = command.kind_index();
-                    let _ = super::with_pool(|| match command {
-                        ButtonCommand::Click(button, count) => {
-                            super::native_mouse::click(button, count)
+                    if let Some(mouse) = virtual_hid.as_mut() {
+                        let result = match command {
+                            ButtonCommand::Click(button, count) => {
+                                (0..count).try_for_each(|_| mouse.click(button))
+                            }
+                            ButtonCommand::Press(button) => mouse.press(button),
+                            ButtonCommand::Release(button) => mouse.release(button),
+                        };
+                        if let Err(error) = result {
+                            log::error!("[mouse-backend] virtual HID button report failed: {error:?}");
                         }
-                        ButtonCommand::Press(button) => {
-                            super::native_mouse::press(button)
-                        }
-                        ButtonCommand::Release(button) => {
-                            super::native_mouse::release(button)
-                        }
-                    });
+                    } else {
+                        let _ = super::with_pool(|| match command {
+                            ButtonCommand::Click(button, count) => {
+                                super::native_mouse::click(button, count)
+                            }
+                            ButtonCommand::Press(button) => {
+                                super::native_mouse::press(button)
+                            }
+                            ButtonCommand::Release(button) => {
+                                super::native_mouse::release(button)
+                            }
+                        });
+                    }
                     metrics.button_commands += 1;
                     metrics.button_commands_by_kind[kind_index] += 1;
                     metrics.button_queue_age[kind_index]
@@ -1123,6 +1214,30 @@ mod relative_mouse {
             let flags = movement_event_flags();
             assert!(!flags.contains(CGEventFlags::CGEventFlagNonCoalesced));
             assert_eq!(flags.bits() & 0x2000_0000, 0);
+        }
+
+        #[test]
+        fn mouse_backend_defaults_to_quartz_until_virtual_hid_is_explicit() {
+            assert_eq!(
+                MouseBackendPreference::parse(None),
+                MouseBackendPreference::Quartz
+            );
+            assert_eq!(
+                MouseBackendPreference::parse(Some("quartz")),
+                MouseBackendPreference::Quartz
+            );
+            assert_eq!(
+                MouseBackendPreference::parse(Some("unexpected")),
+                MouseBackendPreference::Quartz
+            );
+            assert_eq!(
+                MouseBackendPreference::parse(Some(" virtual-hid ")),
+                MouseBackendPreference::VirtualHid
+            );
+            assert_eq!(
+                MouseBackendPreference::parse(Some("HID")),
+                MouseBackendPreference::VirtualHid
+            );
         }
 
         #[test]
