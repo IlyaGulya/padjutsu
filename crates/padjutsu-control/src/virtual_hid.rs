@@ -203,7 +203,8 @@ fn button_bit<E>(button: Button) -> Result<u8, VirtualHidError<E>> {
 }
 
 #[cfg(target_os = "macos")]
-mod native {
+#[allow(dead_code)]
+mod iohid {
     use std::ffi::{c_void, CString};
     use std::fmt;
     use std::ptr;
@@ -304,11 +305,11 @@ mod native {
         }
     }
 
-    pub(crate) struct NativeHidSink {
+    pub(crate) struct IoHidUserDeviceSink {
         device: IOHIDUserDeviceRef,
     }
 
-    impl NativeHidSink {
+    impl IoHidUserDeviceSink {
         pub(crate) fn create() -> Result<Self, NativeHidError> {
             let properties = DeviceProperties::create()?;
             let device = unsafe {
@@ -325,7 +326,7 @@ mod native {
         }
     }
 
-    impl HidReportSink for NativeHidSink {
+    impl HidReportSink for IoHidUserDeviceSink {
         type Error = NativeHidError;
 
         fn send_report(&mut self, report: MouseReport) -> Result<(), Self::Error> {
@@ -346,7 +347,7 @@ mod native {
         }
     }
 
-    impl Drop for NativeHidSink {
+    impl Drop for IoHidUserDeviceSink {
         fn drop(&mut self) {
             unsafe { CFRelease(self.device) };
         }
@@ -472,7 +473,155 @@ mod native {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use native::NativeHidSink;
+mod bridge {
+    use std::env;
+    use std::fmt;
+    use std::io::{self, Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use super::{HidReportSink, MouseReport};
+
+    const DEFAULT_SOCKET_PATH: &str = "/var/run/padjutsu-hid-bridge.sock";
+    const BRIDGE_OK: u8 = 0;
+
+    #[derive(Debug)]
+    pub(crate) enum BridgeHidError {
+        Io(io::Error),
+        Rejected(u8),
+    }
+
+    impl fmt::Display for BridgeHidError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Io(error) => {
+                    write!(formatter, "virtual HID bridge I/O failed: {error}")
+                }
+                Self::Rejected(status) => {
+                    write!(
+                        formatter,
+                        "virtual HID bridge rejected request: {status}"
+                    )
+                }
+            }
+        }
+    }
+
+    impl From<io::Error> for BridgeHidError {
+        fn from(error: io::Error) -> Self {
+            Self::Io(error)
+        }
+    }
+
+    pub(crate) struct NativeHidSink {
+        stream: UnixStream,
+        socket_path: PathBuf,
+    }
+
+    impl NativeHidSink {
+        pub(crate) fn create() -> Result<Self, BridgeHidError> {
+            let socket_path = env::var_os("PADJUTSU_HID_BRIDGE_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_PATH));
+            Self::connect(&socket_path)
+        }
+
+        fn connect(path: &Path) -> Result<Self, BridgeHidError> {
+            let stream = UnixStream::connect(path)?;
+            Self::from_stream(stream, path.to_path_buf())
+        }
+
+        fn from_stream(
+            mut stream: UnixStream,
+            socket_path: PathBuf,
+        ) -> Result<Self, BridgeHidError> {
+            stream.set_read_timeout(Some(Duration::from_secs(6)))?;
+            stream.set_write_timeout(Some(Duration::from_millis(20)))?;
+            expect_ok(&mut stream)?;
+            Ok(Self {
+                stream,
+                socket_path,
+            })
+        }
+
+        fn send_once(&mut self, report: MouseReport) -> Result<(), BridgeHidError> {
+            self.stream.write_all(&report.bytes())?;
+            Ok(())
+        }
+
+        fn reconnect(&mut self) -> Result<(), BridgeHidError> {
+            let replacement = Self::connect(&self.socket_path)?;
+            self.stream = replacement.stream;
+            Ok(())
+        }
+    }
+
+    impl HidReportSink for NativeHidSink {
+        type Error = BridgeHidError;
+
+        fn send_report(&mut self, report: MouseReport) -> Result<(), Self::Error> {
+            if self.send_once(report).is_ok() {
+                return Ok(());
+            }
+            self.reconnect()?;
+            self.send_once(report)
+        }
+    }
+
+    fn expect_ok(stream: &mut UnixStream) -> Result<(), BridgeHidError> {
+        let mut status = [0_u8; 1];
+        stream.read_exact(&mut status)?;
+        if status[0] == BRIDGE_OK {
+            Ok(())
+        } else {
+            Err(BridgeHidError::Rejected(status[0]))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::thread;
+
+        use super::*;
+
+        #[test]
+        fn bridge_handshake_and_report_are_acknowledged() {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let join = thread::spawn(move || {
+                server.write_all(&[BRIDGE_OK]).unwrap();
+                let mut report = [0_u8; 5];
+                server.read_exact(&mut report).unwrap();
+                report
+            });
+            let mut sink =
+                NativeHidSink::from_stream(client, PathBuf::new()).unwrap();
+            let report = MouseReport {
+                buttons: 3,
+                dx: -4,
+                dy: 5,
+                wheel: 0,
+                pan: 0,
+            };
+
+            sink.send_report(report).unwrap();
+
+            assert_eq!(join.join().unwrap(), report.bytes());
+        }
+
+        #[test]
+        fn bridge_rejection_is_not_treated_as_ready() {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let join = thread::spawn(move || server.write_all(&[1]).unwrap());
+            let result = NativeHidSink::from_stream(client, PathBuf::new());
+            join.join().unwrap();
+            assert!(matches!(result, Err(BridgeHidError::Rejected(1))));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) use bridge::NativeHidSink;
 
 #[cfg(test)]
 mod tests {
@@ -669,13 +818,5 @@ mod tests {
             mouse.into_sink().reports,
             vec![report(0, 0, 0, 127, -127), report(0, 0, 0, 1, -2)]
         );
-    }
-
-    #[test]
-    #[ignore = "requires a binary signed with the virtual HID entitlement"]
-    fn signed_native_transport_creates_device_and_accepts_report() {
-        let sink = NativeHidSink::create().expect("create virtual HID mouse");
-        let mut mouse = VirtualHidMouse::new(sink);
-        mouse.move_by(1, 0).expect("send virtual HID report");
     }
 }

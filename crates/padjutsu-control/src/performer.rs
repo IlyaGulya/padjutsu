@@ -176,8 +176,9 @@ mod relative_mouse {
 
         fn parse(value: Option<&str>) -> Self {
             match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+                Some("quartz") => Self::Quartz,
                 Some("virtual-hid" | "virtual_hid" | "hid") => Self::VirtualHid,
-                _ => Self::Quartz,
+                _ => Self::VirtualHid,
             }
         }
 
@@ -256,7 +257,9 @@ mod relative_mouse {
                     .name("mouse-event-delivery".into())
                     .stack_size(256 * 1024)
                     .spawn(move || {
-                        set_user_interactive_qos();
+                        crate::worker::set_realtime_priority_4ms(
+                            "mouse-event-delivery",
+                        );
                         run_delivery(
                             rx, stop, generation, submitted, dropped, backend,
                         );
@@ -317,28 +320,6 @@ mod relative_mouse {
             }
             Ok(())
         }
-    }
-
-    fn set_user_interactive_qos() {
-        type QosClassT = u32;
-        const QOS_CLASS_USER_INTERACTIVE: QosClassT = 0x21;
-        unsafe extern "C" {
-            fn pthread_set_qos_class_self_np(
-                qos_class: QosClassT,
-                relative_priority: i32,
-            ) -> i32;
-        }
-        let result =
-            unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
-        if result != 0 {
-            eprintln!("[mouse-event-delivery] failed to set user-interactive QoS: {result}");
-        }
-        padjutsu_metrics::metric!(
-            "thread-policy",
-            "[thread-policy-metrics] name=mouse-event-delivery requested=user_interactive_qos result={} native_result={}",
-            if result == 0 { "success" } else { "failure" },
-            result,
-        );
     }
 
     impl Drop for MouseEventDelivery {
@@ -1217,10 +1198,10 @@ mod relative_mouse {
         }
 
         #[test]
-        fn mouse_backend_defaults_to_quartz_until_virtual_hid_is_explicit() {
+        fn mouse_backend_prefers_virtual_hid_with_explicit_quartz_escape_hatch() {
             assert_eq!(
                 MouseBackendPreference::parse(None),
-                MouseBackendPreference::Quartz
+                MouseBackendPreference::VirtualHid
             );
             assert_eq!(
                 MouseBackendPreference::parse(Some("quartz")),
@@ -1228,7 +1209,7 @@ mod relative_mouse {
             );
             assert_eq!(
                 MouseBackendPreference::parse(Some("unexpected")),
-                MouseBackendPreference::Quartz
+                MouseBackendPreference::VirtualHid
             );
             assert_eq!(
                 MouseBackendPreference::parse(Some(" virtual-hid ")),

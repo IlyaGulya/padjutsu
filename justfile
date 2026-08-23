@@ -5,6 +5,9 @@ VERSION := "0.1.2"
 BIN_PATH_RELEASE := "target/release/padjutsud"
 BIN_PATH_DEBUG := "target/debug/padjutsud"
 BIN_PATH_INSTALLED := env_var_or_default("HOME", "") + "/.cargo/bin/padjutsud"
+HID_BRIDGE_BIN := "target/release/padjutsu-hid-bridge"
+HID_BRIDGE_INSTALLED := "/Library/PrivilegedHelperTools/me.gulya.padjutsu-hid-bridge"
+HID_BRIDGE_PLIST := "/Library/LaunchDaemons/me.gulya.padjutsu-hid-bridge.plist"
 MACOS_DEBUG_SIGN_IDENTITY := "FreeFlow Debug"
 
 BREW_LIBRARY_PATH := `brew --prefix` / "lib"
@@ -23,6 +26,15 @@ start *ARGS:
 install:
   cargo install --locked --profile release --path crates/padjutsud
   codesign --force --sign {{ quote(MACOS_DEBUG_SIGN_IDENTITY) }} {{ quote(BIN_PATH_INSTALLED) }}
+
+[group: 'build']
+install-hid-bridge:
+  cargo build --release -p padjutsu-hid-bridge
+  codesign --force --sign {{ quote(MACOS_DEBUG_SIGN_IDENTITY) }} {{ quote(HID_BRIDGE_BIN) }}
+  sudo install -o root -g wheel -m 755 {{ quote(HID_BRIDGE_BIN) }} {{ quote(HID_BRIDGE_INSTALLED) }}
+  sudo install -o root -g wheel -m 644 packaging/me.gulya.padjutsu-hid-bridge.plist {{ quote(HID_BRIDGE_PLIST) }}
+  sudo launchctl bootout system/me.gulya.padjutsu-hid-bridge 2>/dev/null || true
+  sudo launchctl bootstrap system {{ quote(HID_BRIDGE_PLIST) }}
 
 [group: 'build']
 build: build-release

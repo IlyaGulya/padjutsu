@@ -2,6 +2,7 @@
 members = [
   "crates/padjutsu-control",
   "crates/padjutsu-gamepad",
+  "crates/padjutsu-hid-bridge",
   "crates/padjutsu-metrics",
   "crates/padjutsu-workspace",
   "crates/padjutsu-bit/derive",

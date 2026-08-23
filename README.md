@@ -34,6 +34,7 @@ Or build from source:
 
 ```bash
 just install    # cargo install --release + codesign
+just install-hid-bridge # root virtual-HID bridge via Karabiner DriverKit
 ```
 
 ## Usage

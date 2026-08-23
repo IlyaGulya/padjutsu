@@ -154,7 +154,7 @@ impl PerformerWorker {
             .stack_size(512 * 1024)
             .spawn(move || {
                 #[cfg(target_os = "macos")]
-                set_realtime_priority_2ms();
+                set_realtime_priority_4ms("performer-worker");
                 run(&mut performer, rx, stop_w, dropped_w, mouse_generation_w);
             })
             .expect("failed to spawn performer worker");
@@ -1036,7 +1036,7 @@ fn metrics_report_interval() -> Duration {
 // --- macOS realtime priority for the performer worker thread ---
 
 #[cfg(target_os = "macos")]
-fn set_realtime_priority_2ms() {
+pub(crate) fn set_realtime_priority_4ms(name: &str) {
     use std::os::raw::c_int;
 
     type KernReturnT = c_int;
@@ -1100,17 +1100,19 @@ fn set_realtime_priority_2ms() {
         )
     };
     if kr == KERN_SUCCESS {
-        eprintln!("[performer-worker] realtime priority set");
+        eprintln!("[{name}] realtime priority set");
         padjutsu_metrics::metric!(
             "thread-policy",
-            "[thread-policy-metrics] name=performer-worker requested=time_constraint result=success"
+            "[thread-policy-metrics] name={} requested=time_constraint result=success",
+            name,
         );
     } else {
-        eprintln!("[performer-worker] failed to set RT priority: {kr}");
+        eprintln!("[{name}] failed to set RT priority: {kr}");
         padjutsu_metrics::metric!(
             "thread-policy",
-            "[thread-policy-metrics] name=performer-worker requested=time_constraint result=failure kern_return={}",
-            kr
+            "[thread-policy-metrics] name={} requested=time_constraint result=failure kern_return={}",
+            name,
+            kr,
         );
     }
 }
