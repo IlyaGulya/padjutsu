@@ -72,6 +72,10 @@ pub fn response_frame(request_id: u64, payload: &[u8]) -> Vec<u8> {
     request_response_frame(MESSAGE_TYPE_RESPONSE, request_id, payload)
 }
 
+pub fn heartbeat_frame() -> Vec<u8> {
+    simple_frame(MESSAGE_TYPE_HEARTBEAT, &[])
+}
+
 fn request_response_frame(kind: u8, request_id: u64, payload: &[u8]) -> Vec<u8> {
     let body_len = 1 + REQUEST_ID_LEN + payload.len();
     let mut frame = Vec::with_capacity(4 + body_len);
@@ -172,6 +176,10 @@ where
     pub fn post_report(&mut self, report: LocalMouseReport) -> io::Result<()> {
         self.send_request(&pointing_report_payload(report))?;
         Ok(())
+    }
+
+    pub fn send_heartbeat(&mut self) -> io::Result<()> {
+        write_all(&mut self.stream, &heartbeat_frame())
     }
 
     pub fn pointing_ready(&self) -> bool {
@@ -313,6 +321,11 @@ mod tests {
                 7, 0, 3,
             ]
         );
+    }
+
+    #[test]
+    fn heartbeat_is_an_empty_type_zero_frame() {
+        assert_eq!(heartbeat_frame(), vec![0, 0, 0, 1, 0]);
     }
 
     #[test]

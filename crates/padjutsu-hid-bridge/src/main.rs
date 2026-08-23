@@ -6,11 +6,12 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use padjutsu_hid_bridge::{KarabinerConnection, LocalMouseReport, LOCAL_REPORT_LEN};
 
@@ -19,6 +20,8 @@ const DEFAULT_KARABINER_SOCKET_PATH: &str = "/Library/Application Support/org.pq
 const BRIDGE_OK: u8 = 0;
 const BRIDGE_ERROR: u8 = 1;
 const REPORT_QUEUE_CAPACITY: usize = 1024;
+const MAX_PEEK_FRAME_LEN: usize = 2048;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 struct Options {
     socket_path: PathBuf,
@@ -162,7 +165,6 @@ fn handle_client(client: &mut UnixStream, karabiner_path: &Path) -> io::Result<(
     client.set_write_timeout(Some(Duration::from_millis(100)))?;
 
     let karabiner_stream = UnixStream::connect(karabiner_path)?;
-    karabiner_stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     karabiner_stream.set_write_timeout(Some(Duration::from_millis(100)))?;
     let mut karabiner = KarabinerConnection::new(karabiner_stream);
     karabiner.initialize_pointing()?;
@@ -222,7 +224,14 @@ fn run_delivery(
 ) -> io::Result<()> {
     set_user_interactive_qos("karabiner-hid-delivery");
     let mut pending = None;
+    let mut last_heartbeat = Instant::now();
     loop {
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            karabiner
+                .send_heartbeat()
+                .map_err(|error| with_context(error, "send Karabiner heartbeat"))?;
+            last_heartbeat = Instant::now();
+        }
         let report = match pending.take() {
             Some(report) => report,
             None => match reports.recv_timeout(Duration::from_millis(100)) {
@@ -232,7 +241,14 @@ fn run_delivery(
                 // Darwin rejects sub-second SO_RCVTIMEO values on this socket, so
                 // changing the timeout here would tear down an otherwise healthy
                 // virtual-HID session.
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if karabiner_frame_ready(karabiner.stream_mut())? {
+                        karabiner.pump_once().map_err(|error| {
+                            with_context(error, "pump idle Karabiner frame")
+                        })?;
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             },
         };
@@ -252,6 +268,46 @@ fn run_delivery(
             with_context(error, "post Karabiner pointing report")
         })?;
     }
+}
+
+fn karabiner_frame_ready(stream: &UnixStream) -> io::Result<bool> {
+    let mut bytes = [0_u8; MAX_PEEK_FRAME_LEN];
+    let read = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            libc::MSG_DONTWAIT | libc::MSG_PEEK,
+        )
+    };
+    if read < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::WouldBlock {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    if read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "Karabiner service closed the connection",
+        ));
+    }
+    let read = usize::try_from(read).expect("negative recv result handled above");
+    Ok(complete_wire_frame(&bytes[..read]))
+}
+
+fn complete_wire_frame(bytes: &[u8]) -> bool {
+    let Some(header) = bytes.get(..4) else {
+        return false;
+    };
+    let body_len = u32::from_be_bytes(
+        header
+            .try_into()
+            .expect("four-byte frame header checked above"),
+    ) as usize;
+    body_len > 0 && bytes.len() >= 4 + body_len
 }
 
 fn set_user_interactive_qos(name: &str) {
@@ -274,4 +330,16 @@ fn set_user_interactive_qos(name: &str) {
 #[allow(clippy::needless_pass_by_value)]
 fn with_context(error: io::Error, context: &str) -> io::Error {
     io::Error::new(error.kind(), format!("{context}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_wire_frame;
+
+    #[test]
+    fn idle_pump_waits_for_a_complete_wire_frame() {
+        assert!(!complete_wire_frame(&[]));
+        assert!(!complete_wire_frame(&[0, 0, 0, 2, 7]));
+        assert!(complete_wire_frame(&[0, 0, 0, 2, 7, 8]));
+    }
 }
