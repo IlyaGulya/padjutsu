@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ pub(crate) struct Inner {
 /// Manager responsible for discovering controllers and emitting events.
 pub struct ControllerManager {
     pub(crate) inner: Arc<Inner>,
+    runtime_progress: Arc<AtomicU64>,
 }
 
 impl ControllerManager {
@@ -39,13 +41,28 @@ impl ControllerManager {
         });
 
         let inner_clone = inner.clone();
+        let runtime_progress = Arc::new(AtomicU64::new(0));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        start_runtime_thread(inner_clone, cmd_rx, Some(ready_tx));
+        start_runtime_thread(
+            inner_clone,
+            cmd_rx,
+            Some(ready_tx),
+            runtime_progress.clone(),
+        );
 
         // Best-effort wait for the initial enumeration. Time out if backend fails.
         let _ = ready_rx.recv_timeout(Duration::from_secs(1));
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            runtime_progress,
+        })
+    }
+
+    /// Counts completed SDL event-loop iterations, including idle iterations.
+    /// A separate watchdog can detect a blocked native SDL call from this counter.
+    pub fn runtime_progress(&self) -> Arc<AtomicU64> {
+        self.runtime_progress.clone()
     }
 
     /// Subscribes to controller events. Dropped subscribers are cleaned automatically.

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -144,6 +145,7 @@ pub(crate) fn start_runtime_thread(
     inner: Arc<Inner>,
     cmd_rx: Receiver<Command>,
     ready_tx: Option<std::sync::mpsc::Sender<()>>,
+    runtime_progress: Arc<AtomicU64>,
 ) {
     thread::spawn(move || {
         set_native_thread_name();
@@ -556,6 +558,7 @@ pub(crate) fn start_runtime_thread(
             );
 
             metrics_tick();
+            runtime_progress.fetch_add(1, Ordering::Relaxed);
         }
     });
 }

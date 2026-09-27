@@ -3,6 +3,7 @@ mod activity;
 mod api;
 mod cli;
 mod domain;
+mod gamepad_watchdog;
 mod logging;
 mod runner;
 #[cfg(target_os = "macos")]
@@ -536,6 +537,7 @@ fn run_event_loop(maybe_workspace_path: Option<PathBuf>) {
 
             let manager = ControllerManager::new()
                 .expect("failed to start controller manager");
+            gamepad_watchdog::start(manager.runtime_progress());
             let rx = manager.subscribe();
             let keypress = Performer::new().expect("failed to start keypress");
             let worker = PerformerWorker::spawn(keypress);
